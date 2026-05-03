@@ -1,0 +1,207 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f8faff;
+  --foreground: #1a2b4a;
+  --primary: #3b82f6;
+  --primary-light: #93c5fd;
+  --primary-dark: #1d4ed8;
+  --accent: #6366f1;
+  --surface: #ffffff;
+  --muted: #94a3b8;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: 'Inter', var(--font-geist-sans), sans-serif;
+  --font-mono: var(--font-geist-mono);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: 'Inter', sans-serif;
+  overflow-x: hidden;
+}
+
+/* ── Voice Orb Canvas ────────────────────────────────── */
+.voice-canvas {
+  display: block;
+  margin: 0 auto;
+}
+
+/* ── Status Chip ─────────────────────────────────────── */
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 28px;
+  border-radius: 9999px;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 2.5px;
+  text-transform: uppercase;
+  transition: all 0.4s ease;
+}
+
+.status-chip.standby {
+  background: linear-gradient(135deg, #e0e7ff, #ede9fe);
+  color: #6366f1;
+  border: 1px solid #c7d2fe;
+}
+
+.status-chip.listening {
+  background: linear-gradient(135deg, #dbeafe, #bfdbfe);
+  color: #2563eb;
+  border: 1px solid #93c5fd;
+  animation: pulse-chip 1.5s ease-in-out infinite;
+}
+
+.status-chip.processing {
+  background: linear-gradient(135deg, #fef3c7, #fde68a);
+  color: #d97706;
+  border: 1px solid #fcd34d;
+  animation: pulse-chip-amber 1.2s ease-in-out infinite;
+}
+
+.status-chip.speaking {
+  background: linear-gradient(135deg, #d1fae5, #a7f3d0);
+  color: #059669;
+  border: 1px solid #6ee7b7;
+}
+
+@keyframes pulse-chip {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.3); }
+  50% { box-shadow: 0 0 0 8px rgba(59, 130, 246, 0); }
+}
+
+@keyframes pulse-chip-amber {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.3); }
+  50% { box-shadow: 0 0 0 8px rgba(245, 158, 11, 0); }
+}
+
+/* ── Dot indicator ───────────────────────────────────── */
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.status-dot.standby { background: #6366f1; }
+.status-dot.listening {
+  background: #3b82f6;
+  animation: blink-dot 1s ease-in-out infinite;
+}
+.status-dot.processing {
+  background: #f59e0b;
+  animation: spin-dot 0.8s linear infinite;
+}
+.status-dot.speaking { background: #10b981; }
+
+@keyframes blink-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+@keyframes spin-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.6); }
+}
+
+/* ── Action Buttons ──────────────────────────────────── */
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 18px 46px;
+  border-radius: 16px;
+  border: none;
+  cursor: pointer;
+  font-family: 'Inter', sans-serif;
+  font-size: 18px;
+  font-weight: 700;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  overflow: hidden;
+}
+
+.btn-primary::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 16px;
+  opacity: 0;
+  transition: opacity 0.25s ease;
+}
+
+.btn-primary:hover::before {
+  opacity: 1;
+}
+
+.btn-start {
+  background: linear-gradient(135deg, #3b82f6, #2563eb);
+  color: white;
+  box-shadow: 0 4px 20px rgba(59, 130, 246, 0.35);
+}
+
+.btn-start:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 30px rgba(59, 130, 246, 0.45);
+}
+
+.btn-start:active {
+  transform: translateY(0);
+}
+
+.btn-stop {
+  background: linear-gradient(135deg, #ef4444, #dc2626);
+  color: white;
+  box-shadow: 0 4px 20px rgba(239, 68, 68, 0.35);
+}
+
+.btn-stop:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 30px rgba(239, 68, 68, 0.45);
+}
+
+/* ── Header ──────────────────────────────────────────── */
+.header {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
+  background: rgba(248, 250, 255, 0.85);
+  border-bottom: 1px solid rgba(59, 130, 246, 0.08);
+}
+
+.subtitle-text {
+  font-size: 18px;
+  font-weight: 500;
+  transition: opacity 0.5s ease, transform 0.5s ease;
+}
+
+/* ── Custom scrollbar for light theme ─────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(99, 102, 241, 0.2);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(99, 102, 241, 0.35);
+}

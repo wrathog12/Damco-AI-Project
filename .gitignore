@@ -1,0 +1,82 @@
+# ══════════════════════════════════════════════════════════
+#  Bhasha-Agent — .gitignore
+# ══════════════════════════════════════════════════════════
+
+# ── Environment Variables ─────────────────────────────────
+.env
+.env.local
+.env.example
+# Keep the backend .env.example as a template for contributors
+!backend/.env.example
+
+# ── All .md files EXCEPT root README.md ───────────────────
+*.md
+!/README.md
+
+# ── Python Virtual Environments ───────────────────────────
+one/
+venv/
+env/
+.venv/
+.Python
+
+# ── Python Cache & Bytecode ───────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# ── Node.js ───────────────────────────────────────────────
+node_modules/
+.next/
+.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# ── Scraper Code (not part of the main application) ──────
+/batch_scraper.py
+/collect_urls.py
+/collect_urls_smart.py
+/manual_scraper.py
+/scraper.py
+/schema.py
+/urls_to_scrape.txt
+/utils/
+/tests/
+/requirements.txt
+
+# ── Scraped Data — raw & processed intermediaries ────────
+scraped_data/raw/
+scraped_data/processed/
+
+# ── Test Outputs ──────────────────────────────────────────
+test_*.txt
+test_*.png
+
+# ── OS Files ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+desktop.ini
+
+# ── IDE / Editor ─────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-*
+*.code-workspace
+
+# ── Miscellaneous ────────────────────────────────────────
+*.pem
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+*.tsbuildinfo
+.vercel
