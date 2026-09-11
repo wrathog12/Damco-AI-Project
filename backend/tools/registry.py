@@ -1,188 +1,284 @@
 """
-Tool registry — defines tool schemas for LLM and dispatches calls.
+The five tools: their schemas, and the one place they are dispatched from.
+
+`TOOL_SCHEMAS` is a list of Pipecat `FunctionSchema`s carrying their own handlers,
+so `LLMContext(tools=TOOL_SCHEMAS)` is all a session needs — the LLM service
+registers each handler itself. The same list feeds `/chat`, which runs its own
+small tool loop through `dispatch`.
+
+Two things this module exists to prevent:
+
+* **Two tool tables.** The voice path and the text path must advertise and
+  execute exactly the same five tools, or `/chat` stops being a smoke test for
+  the thing that ships. `_CORES` and `TOOL_SCHEMAS` are checked against each
+  other at import.
+* **Globals.** Every handler gets its database handles and its UI channel from
+  the `ToolContext` in `app_resources` — per session, passed by reference.
+  v1 read both from module globals shared by the whole process.
+
+The five names are the stable contract (cross-cutting rule 1): P1 replaced their
+bodies, P2 replaces the runtime around them, and neither is allowed to rename
+them.
 """
-import json
-from tools.search import search_schemes
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
+
+from loguru import logger
+
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.services.llm_service import FunctionCallParams
+
+from services.resources import Resources
+from tools.card import show_scheme_card
 from tools.details import get_scheme_details
-from tools.card import show_scheme_card_sync
 from tools.eligibility import check_eligibility
-from tools.end_call import end_call_sync
+from tools.end_call import end_call
+from tools.events import Deliver
+from tools.search import search_schemes
 
 
-# ── Tool Schemas (OpenAI format — used by Groq) ────────
-TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_schemes",
-            "description": (
-                "Search the knowledge base for government welfare schemes "
-                "matching the given criteria. Use this when the user asks about "
-                "available schemes, wants to discover schemes, or describes their "
-                "demographics/needs."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "state": {
-                        "type": "string",
-                        "description": "State name, e.g. 'Bihar', 'Maharashtra', 'Central Government'"
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": "Scheme category, e.g. 'Education & Learning', 'Health & Wellness', 'Agriculture & Rural Development', 'Social Welfare & Empowerment', 'Business & Entrepreneurship', 'Housing & Shelter', 'Skills & Employment'"
-                    },
-                    "age": {
-                        "type": "integer",
-                        "description": "User's age in years"
-                    },
-                    "gender": {
-                        "type": "string",
-                        "enum": ["Male", "Female", "All"],
-                        "description": "User's gender"
-                    },
-                    "occupation": {
-                        "type": "string",
-                        "description": "User's occupation, e.g. 'Farmer', 'Student', 'Worker'"
-                    },
-                    "income": {
-                        "type": "integer",
-                        "description": "User's annual income in INR"
-                    },
-                    "caste": {
-                        "type": "string",
-                        "description": "User's caste category: SC, ST, OBC, General"
-                    },
-                    "disability": {
-                        "type": "boolean",
-                        "description": "Whether the user has a disability"
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_scheme_details",
-            "description": (
-                "Get full details about a specific government scheme. "
-                "Use this when the user asks about a specific scheme's details, "
-                "benefits, eligibility, documents, or application process."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "scheme_id": {
-                        "type": "string",
-                        "description": "The scheme ID returned by search_schemes"
-                    },
-                },
-                "required": ["scheme_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "show_scheme_card",
-            "description": (
-                "Show a visual scheme card on the user's screen with all details "
-                "and an apply button. Call this when: (1) the conversation about a "
-                "scheme is concluding, (2) the user wants to see details visually, "
-                "or (3) the user wants to apply."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "scheme_id": {
-                        "type": "string",
-                        "description": "The scheme ID to display"
-                    },
-                    "language": {
-                        "type": "string",
-                        "enum": ["en", "hi", "bn", "mr"],
-                        "description": "Language for the card display. Default 'en'."
-                    },
-                },
-                "required": ["scheme_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "check_eligibility",
-            "description": (
-                "Check if a user is eligible for a specific scheme based on their "
-                "demographics. Use when the user asks 'Am I eligible?' or shares "
-                "their age/income/state/gender."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "scheme_id": {
-                        "type": "string",
-                        "description": "The scheme ID to check eligibility against"
-                    },
-                    "user_age": {"type": "integer", "description": "User's age"},
-                    "user_gender": {"type": "string", "description": "User's gender"},
-                    "user_state": {"type": "string", "description": "User's state of residence"},
-                    "user_income": {"type": "integer", "description": "User's annual income in INR"},
-                    "user_occupation": {"type": "string", "description": "User's occupation"},
-                },
-                "required": ["scheme_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "end_call",
-            "description": (
-                "End the voice call. Call this when: (1) the user says goodbye, "
-                "thanks you, or indicates they are done (e.g. 'nhi thank you', "
-                "'dhanyawad', 'bas itna hi', 'bye', 'theek hai thank you', "
-                "'nahi chahiye aur kuch'), or (2) the user has no further questions."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "reason": {
-                        "type": "string",
-                        "description": "Why the call is ending, e.g. 'user_goodbye', 'user_thanked', 'no_more_questions'"
-                    },
-                },
-                "required": ["reason"],
-            },
-        },
-    },
-]
+@dataclass
+class ToolContext:
+    """What a tool handler is allowed to reach — one per voice session.
+
+    Handed to `PipelineWorker(app_resources=...)`, which is how it arrives as
+    `FunctionCallParams.app_resources`. `deliver` is None on paths with no live
+    client (a script, a test); the two tools that use it degrade to returning
+    their result and skipping the UI event, which is the correct behaviour for a
+    caller that has no screen.
+    """
+    resources: Resources
+    deliver: Deliver | None = None
 
 
-# ── Dispatcher ──────────────────────────────────────────
-_TOOL_MAP = {
-    "search_schemes": search_schemes,
-    "get_scheme_details": get_scheme_details,
-    "show_scheme_card": show_scheme_card_sync,
-    "check_eligibility": check_eligibility,
-    "end_call": end_call_sync,
+Core = Callable[[ToolContext, dict[str, Any]], Awaitable[dict[str, Any]]]
+
+
+# ── the cores: arguments in, result dict out ────────────────────────────
+async def _search(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+    return await search_schemes(ctx.resources, **args)
+
+
+async def _details(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+    return await get_scheme_details(ctx.resources, **args)
+
+
+async def _card(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+    return await show_scheme_card(ctx.resources, deliver=ctx.deliver, **args)
+
+
+async def _eligibility(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+    return await check_eligibility(ctx.resources, **args)
+
+
+async def _end_call(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+    return await end_call(deliver=ctx.deliver, **args)
+
+
+_CORES: dict[str, Core] = {
+    "search_schemes": _search,
+    "get_scheme_details": _details,
+    "show_scheme_card": _card,
+    "check_eligibility": _eligibility,
+    "end_call": _end_call,
 }
 
 
-def dispatch(tool_name: str, arguments: dict) -> str:
-    """
-    Execute a tool by name with the given arguments.
-    Returns the JSON string result.
-    """
-    fn = _TOOL_MAP.get(tool_name)
-    if not fn:
-        return json.dumps({"error": f"Unknown tool: {tool_name}"})
+# ── dispatch ────────────────────────────────────────────────────────────
+async def dispatch(tool_name: str, arguments: dict[str, Any],
+                   ctx: ToolContext) -> dict[str, Any]:
+    """Run one tool. Never raises — a failure comes back as `{"error": ...}`.
 
+    The LLM can recover from an error it can read; it cannot recover from an
+    exception that kills the turn. `None` arguments are stripped so the Python
+    defaults apply, because models routinely send `"state": null` for a filter
+    they mean to omit.
+    """
+    core = _CORES.get(tool_name)
+    if core is None:
+        return {"error": f"Unknown tool: {tool_name}"}
+
+    cleaned = {k: v for k, v in (arguments or {}).items() if v is not None}
     try:
-        # Strip null values so function uses its own defaults
-        cleaned_args = {k: v for k, v in arguments.items() if v is not None}
-        return fn(**cleaned_args)
-    except Exception as e:
-        return json.dumps({"error": f"Tool '{tool_name}' failed: {str(e)}"})
+        return await core(ctx, cleaned)
+    except TypeError as exc:
+        # An argument the schema does not declare, or a missing required one.
+        logger.warning(f"tool {tool_name} called with {cleaned}: {exc}")
+        return {"error": f"Tool '{tool_name}' called incorrectly: {exc}"}
+    except Exception as exc:                                  # noqa: BLE001
+        logger.exception(f"tool {tool_name} failed")
+        return {"error": f"Tool '{tool_name}' failed: {exc}"}
+
+
+def _make_handler(tool_name: str):
+    """The Pipecat-side adapter for one tool."""
+    async def handler(params: FunctionCallParams) -> None:
+        ctx = params.app_resources
+        if not isinstance(ctx, ToolContext):
+            # Worth failing loudly: without a context every tool would report
+            # "not found" and the agent would confidently tell callers there are
+            # no schemes for them.
+            await params.result_callback(
+                {"error": "Tool context unavailable — the session was built "
+                          "without app_resources."})
+            return
+        result = await dispatch(tool_name, dict(params.arguments), ctx)
+        await params.result_callback(result)
+
+    handler.__name__ = f"{tool_name}_handler"
+    return handler
+
+
+# ── schemas ─────────────────────────────────────────────────────────────
+_CATEGORIES = [
+    "Education & Learning",
+    "Social welfare & Empowerment",
+    "Agriculture,Rural & Environment",
+    "Business & Entrepreneurship",
+    "Banking,Financial Services and Insurance",
+    "Health & Wellness",
+    "Sports & Culture",
+    "Skills & Employment",
+    "Housing & Shelter",
+    "Women and Child",
+    "Travel & Tourism",
+    "Science, IT & Communications",
+    "Transport & Infrastructure",
+    "Utility & Sanitation",
+    "Public Safety,Law & Justice",
+]
+
+TOOL_SCHEMAS: list[FunctionSchema] = [
+    FunctionSchema(
+        name="search_schemes",
+        description=(
+            "Find welfare schemes. Call this first for any question about what "
+            "is available. 'query' is the subject of the search; the rest are "
+            "filters that narrow it."
+        ),
+        properties={
+            # Semantic half of the hybrid index. Without it the search is
+            # filter-only, which cannot answer "money for my daughter's
+            # school fees" — see tools/search.py.
+            "query": {
+                "type": "string",
+                "description": "What the user wants, in English, e.g. 'scholarship for girl students', 'loan to start a small shop'",
+            },
+            "state": {
+                "type": "string",
+                "description": "State name, or 'Central Government' for national schemes",
+            },
+            # An enum, not a free-string hint: these are myScheme's own labels
+            # and the filter is an exact keyword match, so an invented near-miss
+            # ("Social Welfare & Empowerment") would return zero rows. Everyday
+            # words are also accepted — `services.schemes._ALIASES` maps them —
+            # which is why the system prompt no longer carries this table.
+            "category": {
+                "type": "string",
+                "enum": _CATEGORIES,
+                "description": "Omit rather than guess — a wrong category filters everything out.",
+            },
+            "age": {"type": "integer", "description": "Age in years"},
+            "gender": {
+                "type": "string",
+                "enum": ["Male", "Female", "All"],
+            },
+            "occupation": {
+                "type": "string",
+                "description": "e.g. 'Farmer', 'Student', 'Worker'",
+            },
+            "income": {"type": "integer", "description": "Annual income in INR"},
+            "caste": {
+                "type": "string",
+                "description": "SC, ST, OBC or General",
+            },
+            "disability": {"type": "boolean"},
+        },
+        required=[],
+        handler=_make_handler("search_schemes"),
+    ),
+    FunctionSchema(
+        name="get_scheme_details",
+        description=(
+            "Full details of one scheme — benefits, eligibility, documents, "
+            "how to apply."
+        ),
+        properties={
+            "scheme_id": {
+                "type": "string",
+                "description": "An id returned by search_schemes",
+            },
+        },
+        required=["scheme_id"],
+        handler=_make_handler("get_scheme_details"),
+    ),
+    FunctionSchema(
+        name="show_scheme_card",
+        description=(
+            "Put a scheme card with an apply button on the user's screen. Call "
+            "it when they want to see or apply for a scheme."
+        ),
+        properties={
+            "scheme_id": {"type": "string"},
+            "language": {
+                "type": "string",
+                "enum": ["en", "hi", "bn", "mr"],
+                "description": "Card language, default 'en'",
+            },
+        },
+        required=["scheme_id"],
+        handler=_make_handler("show_scheme_card"),
+    ),
+    FunctionSchema(
+        name="check_eligibility",
+        description=(
+            "Check whether the user qualifies for one scheme. Use when they ask "
+            "'am I eligible?' or give their age/income/state/gender."
+        ),
+        properties={
+            "scheme_id": {"type": "string"},
+            "user_age": {"type": "integer"},
+            "user_gender": {"type": "string"},
+            "user_state": {"type": "string"},
+            "user_income": {"type": "integer", "description": "Annual, in INR"},
+            "user_occupation": {"type": "string"},
+        },
+        required=["scheme_id"],
+        handler=_make_handler("check_eligibility"),
+    ),
+    FunctionSchema(
+        name="end_call",
+        description=(
+            "End the voice call. Call this when: (1) the user says goodbye, "
+            "thanks you, or indicates they are done (e.g. 'nhi thank you', "
+            "'dhanyawad', 'bas itna hi', 'bye', 'theek hai thank you', "
+            "'nahi chahiye aur kuch'), or (2) the user has no further questions."
+        ),
+        properties={
+            "reason": {
+                "type": "string",
+                "description": "Why the call is ending, e.g. 'user_goodbye', 'user_thanked', 'no_more_questions'",
+            },
+        },
+        # v1 marked this required while the function defaulted it, so a model
+        # that omitted it produced a schema violation for no reason.
+        required=[],
+        handler=_make_handler("end_call"),
+    ),
+]
+
+
+TOOL_NAMES = tuple(s.name for s in TOOL_SCHEMAS)
+
+# The same five schemas in the wire format the Groq/OpenAI SDK wants. `/chat`
+# talks to Groq directly (no Pipecat pipeline), so it needs these — but derived
+# from `TOOL_SCHEMAS`, never hand-maintained alongside it.
+OPENAI_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {"type": "function", "function": s.to_default_dict()} for s in TOOL_SCHEMAS
+]
+
+# The advertised tools and the executable ones drifting apart is a silent
+# failure: the LLM calls something that returns "Unknown tool", or a tool exists
+# that nothing will ever call.
+assert set(TOOL_NAMES) == set(_CORES), (
+    f"schema/handler mismatch: {set(TOOL_NAMES) ^ set(_CORES)}")

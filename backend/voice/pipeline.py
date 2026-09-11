@@ -1,217 +1,344 @@
 """
-Voice pipeline — FastRTC ReplyOnPause generator.
+One voice session = one Pipecat pipeline.
 
-Flow: STT → streaming LLM (sentence-by-sentence) → TTS per sentence.
+This replaces the FastRTC synchronous generator, and with it every workaround it
+needed. Worth being explicit about what is gone, because each one was a real bug:
 
-TTS of sentence 1 plays while LLM generates sentence 2.
-This overlap dramatically reduces perceived latency.
+* **Process-global `conversation_history`.** `make_voice_handler()` was called
+  once at import, so two callers shared one conversation. Now `run_session()` is
+  called per connection and the `LLMContext` it builds belongs to that caller.
+* **`_push_ws_event` + `run_coroutine_threadsafe(...).result(timeout=3.0)`.**
+  The generator ran on a worker thread and blocked up to three seconds per UI
+  push. Everything here is async on the server's own loop.
+* **The `/ws/cards` broadcast list.** UI events now travel over RTVI on the same
+  transport as the audio, addressed to one client.
+* **`_pending_card` / `_pending_end` module globals.** The tools take a
+  `deliver` callback; see `tools/events.py`.
+* **`_inactivity_watcher`.** `PipelineWorker(idle_timeout_secs=...)` raises
+  `on_idle_timeout` itself.
+* **`prompts.build_messages`'s `[-10:]` truncation.** Context summarisation
+  compresses old turns instead of dropping them, so the agent stops forgetting
+  the state you told it four turns ago.
 
-Barge-in is handled by FastRTC: if the user starts speaking while
-the generator is yielding audio, FastRTC interrupts the generator.
+The pipeline:
+
+    transport.input → STT → LanguageTagger → user aggregator
+                    → LLM → TTS → transport.output → CallCloser
+                    → assistant aggregator
+
+The RTVI processor is prepended by `PipelineWorker` itself (`enable_rtvi`), so
+`worker.rtvi.send_server_message(...)` reaches the client without being wired in
+here.
 """
-import json
-import time
-import numpy as np
-from voice import stt, llm, tts
-from tools.card import pop_pending_card
-from tools.end_call import pop_pending_end
+import asyncio
+import uuid
+from typing import Any
+
+from loguru import logger
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.frames.frames import (
+    BotStoppedSpeakingFrame,
+    EndWorkerFrame,
+    Frame,
+    LLMMessagesAppendFrame,
+    TranscriptionFrame,
+    TTSSpeakFrame,
+    TTSUpdateSettingsFrame,
+)
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMAssistantAggregatorParams,
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.services.cartesia.tts import CartesiaTTSService, CartesiaTTSSettings
+from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
+from pipecat.services.google.llm import GoogleLLMService, GoogleLLMSettings
+from pipecat.workers.runner import WorkerRunner
+
+from config import settings as cfg
+from services.resources import Resources
+from tools.end_call import END_EVENT
+from tools.registry import TOOL_SCHEMAS, ToolContext
+from voice.prompts import GREETING, SYSTEM_PROMPT, seed_messages
+from voice.transport import create_transport
+
+# Deepgram's language code → the name to put in front of the user's words.
+# Romanised Hinglish is why this exists: "mujhe scholarship chahiye" in Latin
+# script is genuinely ambiguous to the model, and answering a Hindi speaker in
+# English is the complaint this system gets most.
+_LANGUAGE_NAMES = {
+    "en": "English",
+    "hi": "Hindi",
+    "bn": "Bengali",
+    "mr": "Marathi",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "gu": "Gujarati",
+    "kn": "Kannada",
+    "ml": "Malayalam",
+    "pa": "Punjabi",
+}
+
+# Languages the Cartesia voice can be switched to mid-call. Anything else keeps
+# the current setting rather than sending Cartesia a code it will reject.
+_TTS_LANGUAGES = {"en", "hi", "bn", "mr", "gu", "ta", "te", "kn", "ml", "pl"}
 
 
-# ── Shared WebSocket list (set by main.py) ─────────────────
-_active_ws_list: list = []
-_main_loop = None  # reference to uvicorn's event loop
+def _language_code(language: Any) -> str | None:
+    """`Language.HI` / `"hi-IN"` / `None` → `"hi"` / `None`."""
+    code = getattr(language, "value", language)
+    if not code:
+        return None
+    return str(code).split("-")[0].lower()
 
 
-def set_ws_list(ws_list: list):
-    """Called from main.py to share the active WebSocket connections."""
-    global _active_ws_list
-    _active_ws_list = ws_list
+class LanguageTagger(FrameProcessor):
+    """Tells the LLM — and Cartesia — which language the caller just used.
 
+    Deepgram Nova-3's `multi` mode reports a language per utterance; that report
+    is the only language signal in the system, and v1 spent it by pasting
+    `[User is speaking Hindi]` onto the front of the user's transcript. That
+    worked but put scaffolding inside the conversation: the text went into
+    context, into the client's transcript display, and into every later turn.
 
-def set_event_loop(loop):
-    """Called from main.py to share the main asyncio event loop."""
-    global _main_loop
-    _main_loop = loop
-
-
-def _push_ws_event(data: dict):
-    """Push a JSON event to all connected frontend WebSockets (thread-safe)."""
-    import asyncio
-
-    payload = json.dumps(data, ensure_ascii=False)
-
-    if not _active_ws_list:
-        print("[WS] No active WebSocket connections, skipping push")
-        return
-
-    async def _send_all():
-        for ws in _active_ws_list:
-            try:
-                await ws.send_text(payload)
-            except Exception as e:
-                print(f"[WS] Send failed: {e}")
-
-    if _main_loop and _main_loop.is_running():
-        # Schedule on the main event loop from this sync thread
-        future = asyncio.run_coroutine_threadsafe(_send_all(), _main_loop)
-        try:
-            future.result(timeout=3.0)  # wait up to 3s for delivery
-        except Exception as e:
-            print(f"[WS] Push failed: {e}")
-    else:
-        print("[WS] Main event loop not available, cannot push event")
-
-# ── Activity tracking (for inactivity timer) ──────────────
-last_activity_ts: float = 0.0   # epoch seconds of last voice trigger
-
-
-# ── Per-session state ──────────────────────────────────────
-
-def make_voice_handler():
+    Here the tag is a separate one-line context message, emitted only when the
+    language *changes*, and the transcript itself is left alone. It also retunes
+    the TTS voice on the same signal, because a Bengali reply rendered with the
+    Hindi language setting is intelligible but wrong-sounding.
     """
-    Factory: returns a generator function with its own
-    conversation_history (one per WebRTC session).
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._current: str | None = None
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            code = _language_code(frame.language)
+            if code and code != self._current:
+                self._current = code
+                name = _LANGUAGE_NAMES.get(code)
+                if name:
+                    # run_llm=False: this only annotates the context. The user
+                    # aggregator runs the LLM when the turn ends, and running it
+                    # here would answer half an utterance.
+                    await self.push_frame(LLMMessagesAppendFrame(
+                        messages=[{
+                            "role": "system",
+                            "content": (f"The user is now speaking {name}. "
+                                        f"Reply in {name}."),
+                        }],
+                        run_llm=False,
+                    ), direction)
+                if code in _TTS_LANGUAGES:
+                    await self.push_frame(
+                        TTSUpdateSettingsFrame(settings={"language": code}),
+                        direction)
+
+        await self.push_frame(frame, direction)
+
+
+class CallCloser(FrameProcessor):
+    """Ends the pipeline after the goodbye has actually been spoken.
+
+    `end_call` only sends its event; if it ended the session itself the caller
+    would hear the sentence cut off mid-word, because the LLM has not even
+    generated the goodbye at the point the tool returns. So the tool arms this,
+    and this waits for the bot to stop speaking.
+
+    It sits after `transport.output()`, which is where `BotStoppedSpeakingFrame`
+    is emitted from.
     """
-    conversation_history: list[dict] = []
 
-    def voice_response(audio: tuple[int, np.ndarray]):
-        """
-        Called by ReplyOnPause when user stops speaking.
+    def __init__(self) -> None:
+        super().__init__()
+        self._armed = False
+        self._ending = False
 
-        Pipeline: STT → LLM (streaming sentences) → TTS per sentence.
+    def arm(self) -> None:
+        self._armed = True
 
-        Each sentence is TTS'd and yielded immediately, so the user
-        hears the first sentence while the LLM is still generating
-        the rest.
-        """
-        nonlocal conversation_history
-        global last_activity_ts
-        last_activity_ts = time.time()   # mark activity
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        await self.push_frame(frame, direction)
 
-        sr, audio_array = audio
-
-        # Flatten if 2D (FastRTC sends (1, N))
-        if audio_array.ndim == 2:
-            audio_array = audio_array.flatten()
-
-        # ── Notify frontend: processing started ──────────
-        _push_ws_event({"type": "status_change", "status": "processing"})
-
-        # ── Stage 1: STT ─────────────────────────────────
-        t0 = time.perf_counter()
-        transcript, detected_lang = stt.transcribe(audio_array, sr)
-        stt_ms = round((time.perf_counter() - t0) * 1000)
-
-        if not transcript.strip():
-            print("[PIPELINE] Empty transcript, skipping")
-            _push_ws_event({"type": "status_change", "status": "listening"})
-            return
-
-        print(f"[STT] ({detected_lang}) \"{transcript}\"  [{stt_ms}ms]")
-
-        # ── Stage 2+3: Streaming LLM → Sentence TTS ─────
-        t_llm_start = time.perf_counter()
-        sentence_count = 0
-        total_tts_ms = 0
-        total_samples = 0
-        first_audio_ms = None
-
-        card_pushed = False
-        end_pushed = False
-
-        try:
-            for sentence, is_final in llm.chat_streaming(
-                user_message=transcript,
-                conversation_history=conversation_history,
-                detected_language=detected_lang,
-            ):
-                sentence_count += 1
-                llm_ms = round((time.perf_counter() - t_llm_start) * 1000)
-
-                if sentence_count == 1:
-                    print(f"[LLM] First sentence in {llm_ms}ms: \"{sentence}\"")
-
-                # ── Check for pending card and PUSH to frontend ──
-                # Tool calls complete before streaming, so card is ready immediately.
-                # Check on every sentence (pop returns None after first call).
-                if not card_pushed:
-                    pending_card = pop_pending_card()
-                    if pending_card:
-                        pending_card["type"] = "show_scheme_card"
-                        scheme_name = pending_card.get("scheme", {}).get("scheme_name", "unknown")
-                        print(f"[CARD] Pushing card to frontend: {scheme_name}")
-                        print(f"[CARD] Active WS connections: {len(_active_ws_list)}")
-                        _push_ws_event(pending_card)
-                        card_pushed = True
-
-                # Check for end_call signal
-                if not end_pushed and is_final:
-                    pending_end = pop_pending_end()
-                    if pending_end:
-                        print(f"[END_CALL] Ending call: {pending_end.get('reason')}")
-                        _push_ws_event(pending_end)
-                        end_pushed = True
-
-                # ── TTS this sentence immediately ─────────────
-                if not sentence.strip():
-                    continue
-
-                t_tts = time.perf_counter()
-                chunk_count = 0
-
-                for audio_chunk in tts.synthesize_streaming(sentence):
-                    chunk_count += 1
-                    total_samples += len(audio_chunk)
-
-                    if first_audio_ms is None:
-                        first_audio_ms = round((time.perf_counter() - t_llm_start) * 1000)
-                        _push_ws_event({"type": "status_change", "status": "speaking"})
-
-                    # FastRTC expects (sample_rate, ndarray with shape (1, N))
-                    yield (24000, audio_chunk.reshape(1, -1))
-
-                tts_ms = round((time.perf_counter() - t_tts) * 1000)
-                total_tts_ms += tts_ms
-
-        except Exception as e:
-            print(f"[PIPELINE] LLM/TTS error (recovering): {e}")
-            # Speak a fallback message so the user isn't left hanging
-            fallback = "Sorry, I had a small issue. Could you please repeat that?"
-            try:
-                for audio_chunk in tts.synthesize_streaming(fallback):
-                    yield (24000, audio_chunk.reshape(1, -1))
-            except Exception:
-                pass  # If TTS also fails, just stay silent
-
-        # ── Notify frontend: back to listening ─────────
-        _push_ws_event({"type": "status_change", "status": "listening"})
-
-        # ── Summary ──────────────────────────────────────
-        total_ms = round((time.perf_counter() - t_llm_start) * 1000) + stt_ms
-        print(
-            f"[PIPELINE] Total: {total_ms}ms  "
-            f"(STT={stt_ms} TTFA={first_audio_ms or 0} "
-            f"sentences={sentence_count} TTS_total={total_tts_ms})"
-        )
-
-    return voice_response
+        if (self._armed and not self._ending
+                and isinstance(frame, BotStoppedSpeakingFrame)):
+            self._ending = True
+            logger.info("end_call: goodbye finished, closing the pipeline")
+            await self.push_frame(EndWorkerFrame(reason="end_call"), direction)
 
 
-def make_startup_greeting():
+def _build_services() -> tuple[DeepgramSTTService, GoogleLLMService, CartesiaTTSService]:
+    stt = DeepgramSTTService(
+        api_key=cfg.deepgram_api_key,
+        settings=DeepgramSTTSettings(
+            model=cfg.stt_model,
+            # "multi" — code-switching. See config.stt_live_language.
+            language=cfg.stt_live_language,
+            interim_results=True,
+            punctuate=True,
+            smart_format=True,
+            # See config: without these two, one utterance arrives as several
+            # finals and the LLM answers the first fragment.
+            endpointing=cfg.stt_endpointing_ms,
+            utterance_end_ms=cfg.stt_utterance_end_ms,
+        ),
+    )
+    llm = GoogleLLMService(
+        api_key=cfg.gemini_api_key,
+        settings=GoogleLLMSettings(
+            model=cfg.llm_model,
+            # The system prompt lives here, not in the message list, so context
+            # summarisation cannot rewrite or drop it.
+            system_instruction=SYSTEM_PROMPT,
+            temperature=0.6,
+            max_tokens=cfg.llm_max_tokens,
+            # `thinking_level`, not gpt-oss's `reasoning_effort` — and a declared
+            # settings field rather than something smuggled through `extra`.
+            thinking=GoogleLLMService.ThinkingConfig(
+                thinking_level=cfg.llm_thinking_level),
+        ),
+    )
+    tts = CartesiaTTSService(
+        api_key=cfg.cartesia_api_key,
+        # `voice` on the settings, not the deprecated `voice_id=` argument.
+        # `language` is the starting point only — LanguageTagger retunes it with
+        # a TTSUpdateSettingsFrame when the caller switches language.
+        settings=CartesiaTTSSettings(
+            model=cfg.tts_model,
+            voice=cfg.tts_voice_id,
+            language="hi",
+        ),
+    )
+    return stt, llm, tts
+
+
+async def run_session(
+    resources: Resources,
+    *,
+    webrtc_connection: Any | None = None,
+    conversation_id: str | None = None,
+) -> None:
+    """Serve one caller from connect to hang-up. Returns when the call ends.
+
+    `resources` is the process-wide pool handed in from the FastAPI lifespan —
+    shared deliberately, because a connection pool per caller would exhaust
+    Postgres. Everything else in here is built fresh per session.
     """
-    Factory: returns a generator function that speaks
-    a welcome message when the WebRTC connection starts.
-    """
-    def startup():
-        greeting = (
-            "Hello! I am Bhasha Agent, your voice assistant for "
-            "government welfare schemes. "
-            "Which state are you from, and what kind of scheme "
-            "are you looking for?"
-        )
-        print("[STARTUP] Speaking greeting...")
-        for audio_chunk in tts.synthesize_streaming(greeting):
-            yield (24000, audio_chunk.reshape(1, -1))
-        print("[STARTUP] Greeting complete")
+    conversation_id = conversation_id or str(uuid.uuid4())
+    log = logger.bind(call=conversation_id[:8])
 
-    return startup
+    transport = create_transport(webrtc_connection=webrtc_connection)
+    stt, llm, tts = _build_services()
+
+    context = LLMContext(messages=seed_messages(), tools=TOOL_SCHEMAS)
+    aggregators = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            # In Pipecat 1.9 VAD belongs to the user aggregator, not the
+            # transport — TransportParams has no vad_analyzer field.
+            vad_analyzer=SileroVADAnalyzer(
+                params=VADParams(stop_secs=cfg.vad_stop_secs)),
+        ),
+        assistant_params=LLMAssistantAggregatorParams(
+            # Replaces the [-10:] truncation: old turns are compressed instead
+            # of discarded, so the caller's state and age survive a long call.
+            enable_auto_context_summarization=True,
+        ),
+    )
+
+    tagger = LanguageTagger()
+    closer = CallCloser()
+
+    # `deliver` is filled in below — the callback needs the worker, and the
+    # worker needs this object as its app_resources.
+    tool_ctx = ToolContext(resources=resources)
+
+    pipeline = Pipeline([
+        transport.input(),
+        stt,
+        tagger,
+        aggregators.user(),
+        llm,
+        tts,
+        transport.output(),
+        closer,
+        aggregators.assistant(),
+    ])
+
+    worker = PipelineWorker(
+        pipeline,
+        app_resources=tool_ctx,
+        conversation_id=conversation_id,
+        idle_timeout_secs=cfg.idle_timeout_secs,
+        # We hang up ourselves so the client is told why first.
+        cancel_on_idle_timeout=False,
+        params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+    )
+
+    async def deliver(event: dict[str, Any]) -> None:
+        """The session's own channel to its own client — nobody else's."""
+        await worker.rtvi.send_server_message(event)
+        if event.get("type") == END_EVENT:
+            closer.arm()
+
+    tool_ctx.deliver = deliver
+
+    running = asyncio.Event()
+
+    @worker.event_handler("on_pipeline_started")
+    async def _on_started(_worker, _frame):
+        running.set()
+
+    @transport.event_handler("on_client_connected")
+    async def _on_connected(_transport, _client):
+        log.info("client connected")
+
+        async def greet() -> None:
+            # Processors drop frames that arrive before StartFrame, and with
+            # SmallWebRTC the peer connection is often already up by the time
+            # the pipeline starts — so wait, in a task. Awaiting `running` in
+            # the handler itself would deadlock: pipeline start waits on
+            # transport start, which waits on this handler.
+            await running.wait()
+            # A fixed greeting rather than an LLM turn: it is instant, always in
+            # the right words, and the model cannot decide to open with
+            # something else.
+            #
+            # Only the TTS frame — no LLMMessagesAppendFrame. The assistant
+            # aggregator already records spoken text into the context, so
+            # appending it here as well put the greeting in twice, which is how
+            # the first draft of this ended up with a context whose last two
+            # messages were identical.
+            await worker.queue_frames([TTSSpeakFrame(GREETING)])
+
+        worker.create_task(greet(), name="greeting")
+
+    @transport.event_handler("on_client_disconnected")
+    async def _on_disconnected(_transport, _client):
+        log.info("client disconnected")
+        await worker.cancel()
+
+    @worker.event_handler("on_idle_timeout")
+    async def _on_idle(_worker):
+        log.info(f"idle for {cfg.idle_timeout_secs}s, ending the call")
+        await deliver({"type": END_EVENT, "reason": "inactivity"})
+        await worker.stop_when_done()
+
+    log.info(f"session start (transport={cfg.transport}, model={cfg.llm_model})")
+    # handle_sigint=False: this runner lives inside uvicorn, one per call.
+    # Letting it install process signal handlers would mean the newest caller
+    # owns Ctrl-C for the whole server.
+    runner = WorkerRunner(handle_sigint=False)
+    try:
+        await runner.run(worker)
+    finally:
+        log.info("session end")

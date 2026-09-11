@@ -22,16 +22,31 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
+def make_engine() -> AsyncEngine:
+    """A fresh engine with the standard pool settings.
+
+    asyncpg connections belong to the event loop that opened them, so anything
+    running on its own loop — an ingestion script, a test harness — must own its
+    own engine rather than sharing the process-wide one from `get_engine()`. This
+    exists so that "own your engine" does not also mean "duplicate the pool
+    config".
+
+    The server itself calls this once, through `services.resources.create()`, in
+    the FastAPI lifespan.
+    """
+    return create_async_engine(
+        settings.database_url,
+        pool_size=10,
+        max_overflow=20,
+        pool_pre_ping=True,  # survive Postgres restarts / idle timeouts
+        echo=False,
+    )
+
+
 def get_engine() -> AsyncEngine:
     global _engine
     if _engine is None:
-        _engine = create_async_engine(
-            settings.database_url,
-            pool_size=10,
-            max_overflow=20,
-            pool_pre_ping=True,  # survive Postgres restarts / idle timeouts
-            echo=False,
-        )
+        _engine = make_engine()
     return _engine
 
 

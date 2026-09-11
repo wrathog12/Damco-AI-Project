@@ -8,8 +8,19 @@ pydantic-settings>=2.6.0
 python-dotenv>=1.0.0
 websockets>=13.0
 numpy>=1.26.0
-fastrtc[vad]>=0.0.20
-gradio>=5.0.0
+
+# ── Voice pipeline (P2) ─────────────────────────────────
+# Replaces fastrtc[vad] + gradio. Pinned: 1.9 moved VAD off TransportParams onto
+# LLMUserAggregatorParams and replaced PipelineTask/EndTaskFrame with
+# PipelineWorker/EndWorkerFrame, so a float here would break voice/pipeline.py.
+# The `groq`, `deepgram-sdk` and `cartesia` pins above are still needed — the
+# benchmark in test.py calls those SDKs directly.
+#
+# `google` extra, not `groq`: the conversation model is Gemini Flash-Lite now
+# (see config.py's LLM block). It is what pulls in `google-genai`, which the
+# embedding path in `embeddings/` already depended on implicitly.
+pipecat-ai[silero,deepgram,cartesia,google,webrtc]==1.9.0
+pipecat-ai-prebuilt          # the dev client mounted at /client
 
 # ── Data layer (P0/P1) ──────────────────────────────────
 sqlalchemy[asyncio]>=2.0.36

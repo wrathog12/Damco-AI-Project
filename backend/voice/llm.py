@@ -1,76 +1,92 @@
 """
-LLM wrapper — Groq Llama 3.3 70B with streaming + tool-calling.
+The `/chat` tool loop — text only.
 
-Two modes:
-  - chat()           → non-streaming, returns full response (for /chat endpoint)
-  - chat_streaming()  → streaming, yields sentences as they arrive (for voice pipeline)
+Voice no longer comes through here. Pipecat's `GroqLLMService` owns the spoken
+conversation: it streams, it aggregates context, and it invokes the tool handlers
+in `tools/registry.py` itself. What remains is the text endpoint, which the plan
+keeps deliberately — it is the fastest way to exercise the five tools without
+audio, and it was the gate that verified P1.
+
+So `chat_streaming` is gone (Pipecat does it better, on the event loop) and
+`chat` is async. v1 called the fully synchronous version directly on the event
+loop, blocking the whole server for the length of three Groq round-trips.
 """
 import json
-import re
-from groq import Groq
+
+from groq import AsyncGroq
+from loguru import logger
+
 from config import settings
-from tools.registry import TOOL_SCHEMAS, dispatch
+from tools.registry import OPENAI_TOOL_SCHEMAS, ToolContext, dispatch
 from voice.prompts import build_messages
 
-_client: Groq | None = None
+MAX_TOOL_ROUNDS = 3
+
+_client: AsyncGroq | None = None
 
 
-def _get_client() -> Groq:
+def _get_client() -> AsyncGroq:
+    """One HTTP client for the process.
+
+    A connection pool is not session state — it holds no conversation and no
+    caller's data — so this is not the kind of global cross-cutting rule 2 bans.
+    Everything that *is* per-caller arrives as an argument.
+    """
     global _client
     if _client is None:
-        _client = Groq(api_key=settings.groq_api_key)
+        _client = AsyncGroq(api_key=settings.groq_api_key)
     return _client
 
 
-# ── Sentence boundary detection ────────────────────────
-# Splits on . ? ! but avoids splitting on abbreviations like "Dr." or "Rs."
-_SENTENCE_END = re.compile(r'(?<=[.?!])\s+')
+async def close_client() -> None:
+    """Called from the FastAPI lifespan so the pool doesn't outlive the app."""
+    global _client
+    if _client is not None:
+        await _client.close()
+        _client = None
 
 
-def _split_sentences(text: str) -> list[str]:
-    """Split text into sentences at natural boundaries."""
-    parts = _SENTENCE_END.split(text.strip())
-    return [p.strip() for p in parts if p.strip()]
+async def _complete(messages: list[dict], *, allow_tools: bool = True):
+    """One Groq call. `allow_tools=False` forces prose instead of another call."""
+    client = _get_client()
+    response = await client.chat.completions.create(
+        model=settings.llm_model,
+        messages=messages,
+        tools=OPENAI_TOOL_SCHEMAS,
+        tool_choice="auto" if allow_tools else "none",
+        # See config: too small a budget on a reasoning model returns an empty
+        # message, which on this path looked like "the model had nothing to say".
+        max_tokens=settings.llm_max_tokens,
+        reasoning_effort=settings.llm_reasoning_effort,
+        temperature=0.6,
+    )
+    return response.choices[0].message
 
 
-# ── Non-streaming chat (for /chat text endpoint) ───────
-def chat(
+async def chat(
+    ctx: ToolContext,
     user_message: str,
     conversation_history: list[dict],
     detected_language: str = "en",
 ) -> tuple[str, list[dict]]:
+    """One text turn, tools included. Returns `(reply, history)`.
+
+    `ctx` carries the database handles the tools read through and the `Deliver`
+    that collects UI events — `/chat` passes an `EventCollector`, so a
+    `show_scheme_card` call comes back in the HTTP response instead of being
+    dropped the way v1's mismatched `show_card` broadcast was.
+
+    `detected_language` is accepted and unused on this path: the text caller
+    states its language in the request and the model reads it from the message
+    itself. The voice path's `[User is speaking X]` tag now lives in
+    `voice/pipeline.py`, where the STT result actually is.
     """
-    Send a message to Llama 3.3 with tool-calling support.
-    Non-streaming — returns full response. Used by /chat endpoint.
+    conversation_history.append({"role": "user", "content": user_message})
 
-    Returns:
-        (response_text, updated_history)
-    """
-    client = _get_client()
+    msg = await _complete(build_messages(conversation_history))
 
-    conversation_history.append({
-        "role": "user",
-        "content": user_message,
-    })
-
-    messages = build_messages(conversation_history)
-
-    response = client.chat.completions.create(
-        model=settings.llm_model,
-        messages=messages,
-        tools=TOOL_SCHEMAS,
-        tool_choice="auto",
-        max_tokens=256,
-        temperature=0.6,
-    )
-
-    msg = response.choices[0].message
-
-    # Handle tool calls
-    max_rounds = 3
     rounds = 0
-
-    while msg.tool_calls and rounds < max_rounds:
+    while msg.tool_calls and rounds < MAX_TOOL_ROUNDS:
         rounds += 1
 
         conversation_history.append({
@@ -93,192 +109,29 @@ def chat(
             try:
                 args = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
+                # Hallucinated tool syntax. An empty dict lets the tool's own
+                # defaults apply and the model see a real result instead of a
+                # crash.
                 args = {}
 
-            print(f"  [TOOL] {tc.function.name}({args})")
-            result = dispatch(tc.function.name, args)
+            logger.info(f"[TOOL] {tc.function.name}({args})")
+            result = await dispatch(tc.function.name, args, ctx)
 
             conversation_history.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
-                "content": result,
+                # ensure_ascii=False: scheme text is Devanagari/Bengali and
+                # escaping it doubles the token count for no benefit.
+                "content": json.dumps(result, ensure_ascii=False),
             })
 
-        messages = build_messages(conversation_history)
-
-        response = client.chat.completions.create(
-            model=settings.llm_model,
-            messages=messages,
-            tools=TOOL_SCHEMAS,
-            tool_choice="auto",
-            max_tokens=256,
-            temperature=0.6,
-        )
-
-        msg = response.choices[0].message
+        # On the last permitted round, take tools off the table. Otherwise the
+        # model spends the round retrying a search and the loop exits holding a
+        # tool call with no prose — which is how v1 returned an empty response
+        # to three of the eight queries in the regression set.
+        msg = await _complete(build_messages(conversation_history),
+                              allow_tools=rounds < MAX_TOOL_ROUNDS)
 
     response_text = msg.content or ""
-
-    conversation_history.append({
-        "role": "assistant",
-        "content": response_text,
-    })
-
+    conversation_history.append({"role": "assistant", "content": response_text})
     return response_text, conversation_history
-
-
-# ── Streaming chat (for voice pipeline) ────────────────
-def chat_streaming(
-    user_message: str,
-    conversation_history: list[dict],
-    detected_language: str = "en",
-):
-    """
-    Streaming LLM with tool-calling. Yields sentences as they complete.
-
-    Tool calls are handled internally (non-streaming, since they're fast).
-    Only the FINAL text response is streamed sentence-by-sentence.
-
-    Yields:
-        (sentence: str, is_final: bool)
-
-    After all sentences are yielded, conversation_history is updated in-place.
-    """
-    client = _get_client()
-
-    # Map Deepgram language codes to readable names
-    lang_map = {"en": "English", "hi": "Hindi", "bn": "Bengali", "mr": "Marathi"}
-    lang_label = lang_map.get(detected_language, detected_language)
-
-    # Tag the user message with detected language so LLM knows what to respond in
-    tagged_message = f"[User is speaking {lang_label}] {user_message}"
-
-    conversation_history.append({
-        "role": "user",
-        "content": tagged_message,
-    })
-
-    messages = build_messages(conversation_history)
-
-    # ── First: handle tool calls (non-streaming) ────────
-    # Tool call responses are short JSON, streaming doesn't help.
-    response = client.chat.completions.create(
-        model=settings.llm_model,
-        messages=messages,
-        tools=TOOL_SCHEMAS,
-        tool_choice="auto",
-        max_tokens=256,
-        temperature=0.6,
-    )
-
-    msg = response.choices[0].message
-    max_rounds = 2
-    rounds = 0
-
-    while msg.tool_calls and rounds < max_rounds:
-        rounds += 1
-
-        conversation_history.append({
-            "role": "assistant",
-            "content": msg.content or "",
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in msg.tool_calls
-            ],
-        })
-
-        for tc in msg.tool_calls:
-            try:
-                args = json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
-                args = {}
-
-            print(f"  [TOOL] {tc.function.name}({args})")
-            result = dispatch(tc.function.name, args)
-
-            conversation_history.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result,
-            })
-
-        messages = build_messages(conversation_history)
-
-        # Check if more tool calls are needed
-        response = client.chat.completions.create(
-            model=settings.llm_model,
-            messages=messages,
-            tools=TOOL_SCHEMAS,
-            tool_choice="auto",
-            max_tokens=256,
-            temperature=0.6,
-        )
-        msg = response.choices[0].message
-
-    # ── If the non-streaming response already has content, check if
-    #    it came from a tool-call round. If so, we already have the
-    #    full response — stream it sentence-by-sentence without
-    #    another API call.
-    if msg.content and not msg.tool_calls:
-        # We got the final response from the tool-call round
-        full_text = msg.content
-        sentences = _split_sentences(full_text)
-
-        if not sentences:
-            sentences = [full_text]
-
-        for i, sentence in enumerate(sentences):
-            is_final = (i == len(sentences) - 1)
-            yield (sentence, is_final)
-
-        conversation_history.append({
-            "role": "assistant",
-            "content": full_text,
-        })
-        return
-
-    # ── Stream the final response sentence-by-sentence ──
-    messages = build_messages(conversation_history)
-
-    stream = client.chat.completions.create(
-        model=settings.llm_model,
-        messages=messages,
-        max_tokens=256,
-        temperature=0.6,
-        stream=True,
-    )
-
-    buffer = ""
-    full_response = ""
-
-    for chunk in stream:
-        delta = chunk.choices[0].delta
-        if delta.content:
-            buffer += delta.content
-            full_response += delta.content
-
-            # Check for sentence boundaries
-            sentences = _split_sentences(buffer)
-
-            if len(sentences) > 1:
-                # Yield all complete sentences, keep the last as buffer
-                for sentence in sentences[:-1]:
-                    yield (sentence, False)
-                buffer = sentences[-1]
-
-    # Yield remaining buffer as the final sentence
-    if buffer.strip():
-        yield (buffer.strip(), True)
-
-    # Update history with full response
-    conversation_history.append({
-        "role": "assistant",
-        "content": full_response,
-    })

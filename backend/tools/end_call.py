@@ -1,32 +1,25 @@
 """
-end_call tool — signals the frontend to terminate the voice session.
+end_call — tell the caller's client the conversation is over.
+
+Only the event is sent here. Tearing the pipeline down is the pipeline's job, and
+it has to wait until the goodbye has actually been spoken — see
+`voice/pipeline.py`, which ends the session on `on_bot_stopped_speaking` after
+this fires. Ending it from inside the handler would cut the goodbye off
+mid-word.
 """
-import json
+from typing import Any
 
-# Pending end-call signal (read and cleared by pipeline)
-_pending_end: dict | None = None
+from tools.events import Deliver
+
+END_EVENT = "end_call"
 
 
-def end_call_sync(reason: str = "user_requested") -> str:
-    """
-    Called by the LLM when the user indicates they want to end the call.
-    Queues an end signal for the pipeline to push over WebSocket.
-    """
-    global _pending_end
-    _pending_end = {
-        "type": "end_call",
-        "reason": reason,
-    }
+async def end_call(*, reason: str = "user_requested",
+                   deliver: Deliver | None = None) -> dict[str, Any]:
+    if deliver is not None:
+        await deliver({"type": END_EVENT, "reason": reason})
 
-    return json.dumps({
+    return {
         "status": "call_ending",
         "message": "Say a brief goodbye to the user before the call ends.",
-    })
-
-
-def pop_pending_end() -> dict | None:
-    """Return and clear any pending end-call signal."""
-    global _pending_end
-    end = _pending_end
-    _pending_end = None
-    return end
+    }

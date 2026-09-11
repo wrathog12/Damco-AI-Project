@@ -1,85 +1,82 @@
 """
-Bhasha-Agent Backend — FastAPI + FastRTC WebRTC voice pipeline.
+Bhasha-Agent backend — FastAPI + Pipecat.
 
-Endpoints:
-  GET  /health           -> health check + KB stats
-  POST /chat             -> text-based tool-calling endpoint (testing)
-  WS   /ws/cards         -> WebSocket for card push events
-  POST /rtc/webrtc/offer -> FastRTC WebRTC signaling (auto-mounted)
-  GET  /gradio/          -> Gradio test UI for voice (sanity check)
+    GET   /health      corpus stats and data-layer status
+    POST  /chat        text tool-calling; the fastest way to exercise the tools
+    POST  /api/offer   WebRTC signalling — starts one voice session per caller
+    PATCH /api/offer   trickle ICE for the above
+    GET   /client      Pipecat's prebuilt dev UI, for testing without the frontend
+
+Gone from v1, deliberately: `/rtc/webrtc/offer` (FastRTC), `/gradio` (a second
+Stream with its own divergent VAD tuning), and `/ws/cards` with its process-wide
+`_active_ws` broadcast list. UI events now go over RTVI on the caller's own
+transport, so a card cannot land on a stranger's screen.
+
+Resources — the Postgres pool, the Qdrant client, the embedder — are created once
+here and handed to each session. Nothing reads them from a module global.
 """
-import json
 import time
-import asyncio
+import uuid
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
+from fastapi import BackgroundTasks, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from loguru import logger
 from pydantic import BaseModel
 
+from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+from pipecat.transports.smallwebrtc.request_handler import (
+    SmallWebRTCPatchRequest,
+    SmallWebRTCRequest,
+    SmallWebRTCRequestHandler,
+)
+
 from config import settings
-from knowledge import loader
+from services import resources as resource_factory
+from services import schemes as scheme_service
+from tools.card import CARD_EVENT
+from tools.events import EventCollector
+from tools.registry import ToolContext
 from voice import llm
-from tools.card import pop_pending_card
+from voice.pipeline import run_session
+from voice.transport import ice_servers
 
 
-# ── Lifespan: load KB on startup ────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    count = loader.load(settings.kb_path)
-    print(f"[SERVER] Knowledge base loaded: {count} schemes")
-    print(f"[SERVER] LLM model: {settings.llm_model}")
+    # Open the pool here rather than on the first tool call: that call would
+    # otherwise pay for a Postgres connect and the embedder's first request while
+    # a caller is waiting mid-sentence.
+    app.state.resources = await resource_factory.create()
 
-    # Share the WebSocket list and event loop with the voice pipeline
-    from voice.pipeline import set_ws_list, set_event_loop
-    set_ws_list(_active_ws)
-    set_event_loop(asyncio.get_event_loop())
+    try:
+        stats = await scheme_service.stats(app.state.resources)
+        logger.info(
+            f"corpus: {stats['total_schemes']} schemes in Postgres, "
+            f"{stats['indexed_schemes']} indexed in Qdrant, "
+            f"{len(stats['states'])} states, {len(stats['categories'])} categories")
+        if not stats["semantic_search"]:
+            logger.warning("no embeddings available — search is filter-only")
+    except Exception as exc:                                  # noqa: BLE001
+        # Don't refuse to boot; /health is the endpoint that should report this.
+        logger.warning(f"data layer unavailable: {exc}")
 
-    # Start inactivity timer
-    inactivity_task = asyncio.create_task(_inactivity_watcher())
+    logger.info(f"llm={settings.llm_model} transport={settings.transport}")
 
     yield
 
-    # Shutdown
-    inactivity_task.cancel()
-    print("[SERVER] Shutting down")
-
-
-INACTIVITY_TIMEOUT = 120  # seconds
-
-
-async def _inactivity_watcher():
-    """Background task: if no voice activity for 35s after a call starts, push end_call."""
-    import voice.pipeline as pipeline
-
-    while True:
-        await asyncio.sleep(5)  # check every 5 seconds
-
-        ts = pipeline.last_activity_ts
-        if ts == 0.0:
-            continue  # no call has started yet
-
-        elapsed = time.time() - ts
-        if elapsed >= INACTIVITY_TIMEOUT and _active_ws:
-            print(f"[INACTIVITY] No activity for {int(elapsed)}s — ending call")
-            payload = json.dumps({"type": "end_call", "reason": "inactivity"})
-            for ws in _active_ws:
-                try:
-                    await ws.send_text(payload)
-                except Exception:
-                    pass
-            # Reset so we don't spam
-            pipeline.last_activity_ts = 0.0
+    await llm.close_client()
+    await app.state.resources.close()
+    logger.info("shut down")
 
 
 app = FastAPI(
     title="Bhasha-Agent API",
     description="Multilingual voice AI for government welfare schemes",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
-# CORS for frontend.
 # Origins come from config (CORS_ORIGINS) — a wildcard is invalid alongside
 # allow_credentials=True, and credentialed requests are needed from P3 onward.
 app.add_middleware(
@@ -91,23 +88,24 @@ app.add_middleware(
 )
 
 
-# ── Active WebSocket connections ────────────────────────
-_active_ws: list[WebSocket] = []
-
-
-# ── Health check ────────────────────────────────────────
+# ── Health ──────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    stats = loader.get_stats()
+    try:
+        stats = await scheme_service.stats(app.state.resources)
+    except Exception as exc:                                  # noqa: BLE001
+        return {"status": "degraded", "error": f"{type(exc).__name__}: {exc}"}
     return {
         "status": "ok",
         "schemes": stats["total_schemes"],
+        "indexed": stats["indexed_schemes"],
+        "semantic_search": stats["semantic_search"],
         "states": stats["states"],
         "categories": stats["categories"],
     }
 
 
-# ── Text chat endpoint (for testing without voice) ─────
+# ── Text chat ───────────────────────────────────────────
 class ChatRequest(BaseModel):
     message: str
     history: list[dict] = []
@@ -123,140 +121,80 @@ class ChatResponse(BaseModel):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest):
+    """One text turn with tool-calling. No audio, no session.
+
+    The card comes back in this response instead of being pushed anywhere. v1
+    broadcast it to every open WebSocket under the name `show_card`, which the
+    frontend does not handle — so REST-triggered cards were silently dropped.
     """
-    Text-based chat endpoint for testing the LLM + tools pipeline.
-    Send a message, get a response with tool-calling.
-    """
-    import time
+    collector = EventCollector()
+    ctx = ToolContext(resources=app.state.resources, deliver=collector)
 
     t0 = time.perf_counter()
-    response_text, history = llm.chat(
+    response_text, history = await llm.chat(
+        ctx,
         user_message=req.message,
         conversation_history=req.history.copy(),
         detected_language=req.language,
     )
     llm_ms = round((time.perf_counter() - t0) * 1000)
 
-    # Check for pending card
-    card = pop_pending_card()
-
-    # If card, broadcast to any connected WebSocket
-    if card:
-        for ws in _active_ws:
-            try:
-                await ws.send_text(json.dumps(card, ensure_ascii=False))
-            except Exception:
-                pass
-
     return ChatResponse(
         response=response_text,
         history=history,
         timings={"llm_ms": llm_ms},
-        card=card,
+        card=collector.first(CARD_EVENT),
     )
 
 
-# ── WebSocket for card events ──────────────────────────
-@app.websocket("/ws/cards")
-async def card_websocket(websocket: WebSocket):
-    await websocket.accept()
-    _active_ws.append(websocket)
-    print(f"[WS] Card WebSocket connected ({len(_active_ws)} active)")
-
-    try:
-        while True:
-            # Listen for messages from frontend (e.g., card dismiss)
-            data = await websocket.receive_text()
-            msg = json.loads(data)
-
-            if msg.get("type") == "dismiss_card":
-                print("[WS] Card dismissed by user")
-                # Could signal pipeline to resume here
-
-    except WebSocketDisconnect:
-        _active_ws.remove(websocket)
-        print(f"[WS] Card WebSocket disconnected ({len(_active_ws)} active)")
+# ── Voice: WebRTC signalling ────────────────────────────
+# One handler for the process; one connection, one pipeline, one context per
+# caller. That is the multi-tenancy fix — v1 built its handler once at import.
+_webrtc = SmallWebRTCRequestHandler(ice_servers=ice_servers() or None)
 
 
-# ══════════════════════════════════════════════════════════
-# FastRTC WebRTC Voice Pipeline
-# ══════════════════════════════════════════════════════════
-from fastrtc import Stream, ReplyOnPause, AlgoOptions, SileroVadOptions
-from voice.pipeline import make_voice_handler, make_startup_greeting
+@app.post("/api/offer")
+async def offer(request: SmallWebRTCRequest, background_tasks: BackgroundTasks):
+    """Answer a caller's SDP offer and start their session in the background."""
+    conversation_id = str(uuid.uuid4())
 
-# Create handler with session state
-handler_fn = make_voice_handler()
-startup_fn = make_startup_greeting()
+    async def on_connection(connection: SmallWebRTCConnection) -> None:
+        # A BackgroundTask, so this request returns the SDP answer immediately;
+        # the session then lives as long as the call.
+        background_tasks.add_task(
+            run_session,
+            app.state.resources,
+            webrtc_connection=connection,
+            conversation_id=conversation_id,
+        )
 
-# FastRTC Stream with ReplyOnPause + barge-in
-stream = Stream(
-    handler=ReplyOnPause(
-        handler_fn,
-        startup_fn=startup_fn,
-        can_interrupt=True,
-        algo_options=AlgoOptions(
-            audio_chunk_duration=0.6,
-            started_talking_threshold=0.3,
-            speech_threshold=0.15,
-        ),
-        model_options=SileroVadOptions(
-            threshold=0.55,
-            min_speech_duration_ms=300,
-            min_silence_duration_ms=150,
-        ),
-    ),
-    modality="audio",
-    mode="send-receive",
-)
+    return await _webrtc.handle_web_request(
+        request=request, webrtc_connection_callback=on_connection)
 
-# Mount WebRTC signaling at /rtc (adds /rtc/webrtc/offer)
-stream.mount(app, path="/rtc")
-print("[SERVER] FastRTC WebRTC mounted at /rtc/webrtc/offer")
 
-# ── Gradio test UI (sanity check) ──────────────────────
-# Access at http://localhost:8000/gradio/ for quick voice testing
-# without needing the Next.js frontend
+@app.patch("/api/offer")
+async def ice_candidate(request: SmallWebRTCPatchRequest):
+    """Trickle ICE. v1's frontend waited a hardcoded 1500ms instead."""
+    await _webrtc.handle_patch_request(request)
+    return {"status": "success"}
+
+
+# ── Dev client ──────────────────────────────────────────
+# Pipecat's prebuilt RTVI UI. This is the P2 verification surface: open it in two
+# browsers and check that each call is its own conversation. The Next.js
+# frontend moves onto the Pipecat React SDK in P4.
 try:
-    import gradio as gr
+    from pipecat_ai_prebuilt.frontend import PipecatPrebuiltUI
 
-    gradio_stream = Stream(
-        handler=ReplyOnPause(
-            make_voice_handler(),
-            startup_fn=make_startup_greeting(),
-            can_interrupt=True,
-            algo_options=AlgoOptions(
-                audio_chunk_duration=0.6,
-                started_talking_threshold=0.2,
-                speech_threshold=0.1,
-            ),
-            model_options=SileroVadOptions(
-                threshold=0.5,
-                min_speech_duration_ms=250,
-                min_silence_duration_ms=100,
-            ),
-        ),
-        modality="audio",
-        mode="send-receive",
-    )
-
-    gradio_app = gr.Blocks()
-    with gradio_app:
-        gr.Markdown("# Bhasha-Agent Voice Test")
-        gr.Markdown("Speak to test the voice pipeline. Barge-in enabled.")
-        gradio_stream.ui.render()
-
-    app = gr.mount_gradio_app(app, gradio_app, path="/gradio")
-    print("[SERVER] Gradio test UI mounted at /gradio")
-except Exception as e:
-    print(f"[SERVER] Gradio UI not available: {e}")
+    app.mount("/client", PipecatPrebuiltUI)
+    logger.info("dev client mounted at /client")
+except ImportError:
+    logger.info("pipecat-ai-prebuilt not installed — /client unavailable")
 
 
-# ── Run ─────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host=settings.host,
-        port=settings.port,
-        reload=False,  # Disable reload — FastRTC state doesn't survive reloads
-    )
+
+    # reload=False on purpose: a reload drops every live call, and the reloader's
+    # double import would build two of everything in the lifespan.
+    uvicorn.run("main:app", host=settings.host, port=settings.port, reload=False)

@@ -1,79 +1,48 @@
 """
-show_scheme_card tool — triggers frontend card popup via WebSocket.
+show_scheme_card — push a rich card to the caller's screen.
+
+The card is delivered through an injected `deliver` callback rather than a
+module-level mailbox. v1 stashed the payload in a global that the pipeline drained
+between sentences, which meant two simultaneous callers could receive each
+other's cards; the callback is bound to one session, so that cannot happen.
+Pipecat passes `rtvi.send_server_message`, `/chat` passes a collector that puts
+the card in its own HTTP response.
+
+The event name is `show_scheme_card` — the same name the frontend already
+handles. v1's `/chat` path broadcast `show_card` instead, so REST-triggered cards
+were silently dropped; one name now, on both paths.
+
+The payload is still rendered in the v1 knowledge-base shape (`metadata.state`,
+`eligibility{}`, `translations{lang}`) because reshaping the card is a P4 item —
+see `services.schemes.card_payload`.
 """
-import json
-from knowledge import loader
+from typing import Any
 
-# This will be set by main.py when a WebSocket connection is active
-_ws_send_callback = None
+from services import schemes as svc
+from services.resources import Resources
 
+from tools.events import Deliver
 
-def set_ws_callback(callback):
-    """Register the WebSocket send function (called from main.py)."""
-    global _ws_send_callback
-    _ws_send_callback = callback
+CARD_EVENT = "show_scheme_card"
 
 
-async def show_scheme_card(scheme_id: str, language: str = "en") -> str:
-    """
-    1. Look up scheme data
-    2. Push card payload to frontend via WebSocket
-    3. Return confirmation for LLM to speak
-    """
-    scheme = loader.get_by_id(scheme_id)
+async def show_scheme_card(
+    res: Resources,
+    *,
+    scheme_id: str,
+    language: str = "en",
+    deliver: Deliver | None = None,
+) -> dict[str, Any]:
+    scheme = await svc.card_payload(res, scheme_id)
+    if scheme is None:
+        return {"error": f"Scheme '{scheme_id}' not found."}
 
-    if not scheme:
-        return json.dumps({"error": f"Scheme '{scheme_id}' not found."})
+    if deliver is not None:
+        await deliver({"type": CARD_EVENT, "scheme": scheme,
+                       "language": language})
 
-    card_payload = {
-        "type": "show_card",
-        "scheme": scheme,
-        "language": language,
-    }
-
-    # Push to frontend if WebSocket is connected
-    if _ws_send_callback:
-        try:
-            await _ws_send_callback(json.dumps(card_payload, ensure_ascii=False))
-        except Exception as e:
-            print(f"[CARD] WebSocket send failed: {e}")
-
-    return json.dumps({
+    return {
         "status": "card_shown",
         "scheme_name": scheme.get("scheme_name"),
         "message": "Scheme card has been displayed on the user's screen.",
-    })
-
-
-def show_scheme_card_sync(scheme_id: str, language: str = "en") -> str:
-    """Synchronous version for tool dispatcher (queues the WS message)."""
-    scheme = loader.get_by_id(scheme_id)
-
-    if not scheme:
-        return json.dumps({"error": f"Scheme '{scheme_id}' not found."})
-
-    # Store pending card for the pipeline to send
-    global _pending_card
-    _pending_card = {
-        "type": "show_card",
-        "scheme": scheme,
-        "language": language,
     }
-
-    return json.dumps({
-        "status": "card_shown",
-        "scheme_name": scheme.get("scheme_name"),
-        "message": "Scheme card has been displayed on the user's screen.",
-    })
-
-
-# Pending card data (read and cleared by pipeline)
-_pending_card = None
-
-
-def pop_pending_card() -> dict | None:
-    """Return and clear any pending card payload."""
-    global _pending_card
-    card = _pending_card
-    _pending_card = None
-    return card

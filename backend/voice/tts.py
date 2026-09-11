@@ -1,6 +1,10 @@
 """
 TTS wrapper — Cartesia Sonic for text-to-speech.
 Returns audio as numpy array (PCM int16).
+
+**Benchmark only**, like `voice/stt.py`. The live pipeline uses Pipecat's
+`CartesiaTTSService`; this exists so `test.py` can keep measuring the stages
+independently for P5's before/after comparison.
 """
 import numpy as np
 from cartesia import Cartesia

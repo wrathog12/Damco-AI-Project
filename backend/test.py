@@ -6,7 +6,7 @@ Usage:
     python test.py
 
 Tests (runs in sequence):
-  1. KB load time
+  1. Data layer warm-up (Postgres pool + Qdrant client + embedder)
   2. Tool execution time (search, details, eligibility)
   3. LLM response time (with tool calling)
   4. STT time (mock audio)
@@ -14,20 +14,38 @@ Tests (runs in sequence):
   6. Full pipeline roundtrip estimate
 
 Requires: .env with valid API keys.
+
+This is the repo's only per-stage timing tool, and P5's verification compares
+against the numbers it produces — so keep it working and keep the output format
+stable. Note that stages 4 and 5 measure the *batch* STT/TTS wrappers, not the
+streaming services the live pipeline now uses: they are the pre-migration
+baseline, which is exactly their value. End-to-end voice latency is measured with
+Pipecat's own metrics (`PipelineParams(enable_metrics=True)`), not here.
 """
-import json
-import time
-import sys
+import asyncio
 import os
+import sys
+import time
 
 # Add backend to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from config import settings                                    # noqa: E402
+
 
 def measure(label: str, fn, *args, **kwargs):
-    """Run a function and print its execution time."""
+    """Run a sync function and print its execution time."""
     t0 = time.perf_counter()
     result = fn(*args, **kwargs)
+    elapsed = (time.perf_counter() - t0) * 1000
+    print(f"  {label:40s}  {elapsed:>8.1f} ms")
+    return result, elapsed
+
+
+async def ameasure(label: str, coro):
+    """Same, for an awaitable. The whole tool path is async as of P2."""
+    t0 = time.perf_counter()
+    result = await coro
     elapsed = (time.perf_counter() - t0) * 1000
     print(f"  {label:40s}  {elapsed:>8.1f} ms")
     return result, elapsed
@@ -39,142 +57,159 @@ def divider(title: str):
     print(f"{'-' * 60}")
 
 
-def main():
+async def main():
     timings = {}
 
     # ════════════════════════════════════════════════════
-    # 1. Knowledge Base Loading
+    # 1. Data layer warm-up
     # ════════════════════════════════════════════════════
-    divider("1. Knowledge Base Loading")
+    # P1 replaced the in-memory JSON knowledge base with Postgres + Qdrant, so
+    # what used to be "load a file" is now "open a pool and a client". Measured
+    # separately because it is a one-off cost the first caller must not pay —
+    # `main.py`'s lifespan does the same warm-up at boot.
+    divider("1. Data layer warm-up")
 
-    from config import settings
-    from knowledge import loader
+    from services import resources as resource_factory
+    from services import schemes as scheme_service
 
-    _, t = measure("Load KB JSON", loader.load, settings.kb_path)
-    timings["kb_load"] = t
+    res, t = await ameasure("Open pool + Qdrant client",
+                            resource_factory.create())
+    timings["data_open"] = t
 
-    stats = loader.get_stats()
-    print(f"  -> {stats['total_schemes']} schemes, {len(stats['states'])} states, {len(stats['categories'])} categories")
+    stats, t = await ameasure("First query (warms the caches)",
+                              scheme_service.stats(res))
+    timings["data_warmup"] = t
+    print(f"  -> {stats['total_schemes']} schemes, "
+          f"{stats['indexed_schemes']} indexed, "
+          f"{len(stats['states'])} states, {len(stats['categories'])} categories")
 
-    # ════════════════════════════════════════════════════
-    # 2. Tool Execution (no API calls — pure Python)
-    # ════════════════════════════════════════════════════
-    divider("2. Tool Execution (in-memory)")
+    try:
+        # ════════════════════════════════════════════════
+        # 2. Tool Execution
+        # ════════════════════════════════════════════════
+        # No longer "in-memory": each search is an embedding round-trip plus a
+        # Qdrant query plus a Postgres join. Expect ~600 ms where v1 measured
+        # ~1 ms — that regression is known, measured, and P5's problem.
+        divider("2. Tool Execution (Postgres + Qdrant)")
 
-    from tools.search import search_schemes
-    from tools.details import get_scheme_details
-    from tools.eligibility import check_eligibility
+        from tools.details import get_scheme_details
+        from tools.eligibility import check_eligibility
+        from tools.search import search_schemes
 
-    result, t = measure("search_schemes(state='Bihar')", search_schemes, state="Bihar")
-    timings["tool_search"] = t
-    parsed = json.loads(result)
-    print(f"  -> {parsed.get('matches', 0)} matches")
+        result, t = await ameasure("search_schemes(state='Bihar')",
+                                   search_schemes(res, state="Bihar"))
+        timings["tool_search"] = t
+        print(f"  -> {result.get('matches', 0)} matches")
 
-    result, t = measure("search_schemes(category='Education')", search_schemes, category="Education & Learning")
-    timings["tool_search_cat"] = t
-    parsed = json.loads(result)
-    print(f"  -> {parsed.get('matches', 0)} matches")
+        result, t = await ameasure(
+            "search_schemes(category='Education')",
+            search_schemes(res, category="Education & Learning"))
+        timings["tool_search_cat"] = t
+        print(f"  -> {result.get('matches', 0)} matches")
 
-    result, t = measure("search_schemes(state='Bihar', occ='Farmer')", search_schemes, state="Bihar", occupation="Farmer")
-    timings["tool_search_multi"] = t
-    parsed = json.loads(result)
-    print(f"  -> {parsed.get('matches', 0)} matches")
+        result, t = await ameasure(
+            "search_schemes(query=..., state, occupation)",
+            search_schemes(res, query="help for farmers after crop loss",
+                           state="Bihar", occupation="Farmer"))
+        timings["tool_search_multi"] = t
+        print(f"  -> {result.get('matches', 0)} matches")
 
-    # Get a real scheme_id from search results
-    search_result = json.loads(search_schemes(state="Bihar"))
-    if search_result.get("schemes"):
-        test_id = search_result["schemes"][0]["scheme_id"]
-    else:
-        test_id = "bihar_education_student_credit_card"
+        # Use a real scheme_id from the results rather than a hardcoded one —
+        # the corpus is rebuilt by ingestion and ids change.
+        found = await search_schemes(res, state="Bihar")
+        schemes = found.get("schemes") or []
+        test_id = (schemes[0]["scheme_id"] if schemes
+                   else "bihar_education_student_credit_card")
 
-    result, t = measure(f"get_scheme_details('{test_id}')", get_scheme_details, test_id)
-    timings["tool_details"] = t
-    print(f"  -> {len(result)} chars returned")
+        result, t = await ameasure(f"get_scheme_details('{test_id[:24]}')",
+                                   get_scheme_details(res, scheme_id=test_id))
+        timings["tool_details"] = t
+        print(f"  -> {len(result)} fields returned")
 
-    result, t = measure(f"check_eligibility(age=22, state='Bihar')", check_eligibility, test_id, user_age=22, user_state="Bihar")
-    timings["tool_eligibility"] = t
-    parsed = json.loads(result)
-    print(f"  -> eligible: {parsed.get('eligible')}")
+        result, t = await ameasure(
+            "check_eligibility(age=22, state='Bihar')",
+            check_eligibility(res, scheme_id=test_id, user_age=22,
+                              user_state="Bihar"))
+        timings["tool_eligibility"] = t
+        print(f"  -> eligible: {result.get('eligible')}")
 
-    # ════════════════════════════════════════════════════
-    # 3. LLM (Groq) — requires API key
-    # ════════════════════════════════════════════════════
-    divider("3. LLM (Groq Llama 3.3)")
+        # ════════════════════════════════════════════════
+        # 3. LLM (Groq) — requires API key
+        # ════════════════════════════════════════════════
+        divider(f"3. LLM (Groq {settings.llm_model})")
 
-    if not settings.groq_api_key or settings.groq_api_key.startswith("gsk_xxx"):
-        print("  [SKIP] GROQ_API_KEY not set, skipping LLM test")
-        timings["llm_simple"] = None
-        timings["llm_tool_call"] = None
-    else:
-        from voice import llm
-
-        # Simple response (no tools)
-        _, t = measure(
-            "Simple greeting",
-            llm.chat,
-            user_message="Hello, what can you help me with?",
-            conversation_history=[],
-            detected_language="en",
-        )
-        timings["llm_simple"] = t
-
-        # With tool calling
-        try:
-            _, t = measure(
-                "Tool call: 'Bihar mein farmer schemes'",
-                llm.chat,
-                user_message="Bihar mein farmer ke liye koi scheme hai?",
-                conversation_history=[],
-                detected_language="hi",
-            )
-            timings["llm_tool_call"] = t
-        except Exception as e:
-            print(f"  [ERROR] Tool call failed: {e}")
+        if not settings.groq_api_key or settings.groq_api_key.startswith("gsk_xxx"):
+            print("  [SKIP] GROQ_API_KEY not set, skipping LLM test")
+            timings["llm_simple"] = None
             timings["llm_tool_call"] = None
+        else:
+            from tools.events import EventCollector
+            from tools.registry import ToolContext
+            from voice import llm
 
-    # ════════════════════════════════════════════════════
-    # 4. STT (Deepgram) — requires API key
-    # ════════════════════════════════════════════════════
-    divider("4. STT (Deepgram Nova-3)")
+            ctx = ToolContext(resources=res, deliver=EventCollector())
 
-    if not settings.deepgram_api_key or settings.deepgram_api_key.startswith("xxx"):
-        print("  [SKIP] DEEPGRAM_API_KEY not set, skipping STT test")
-        timings["stt"] = None
-    else:
-        import numpy as np
-        from voice import stt
+            _, t = await ameasure(
+                "Simple greeting",
+                llm.chat(ctx, user_message="Hello, what can you help me with?",
+                         conversation_history=[], detected_language="en"))
+            timings["llm_simple"] = t
 
-        # Generate 2 seconds of fake audio (silence with some noise)
-        fake_audio = (np.random.randn(48000 * 2) * 100).astype(np.int16)
+            try:
+                _, t = await ameasure(
+                    "Tool call: 'Bihar mein farmer schemes'",
+                    llm.chat(ctx,
+                             user_message="Bihar mein farmer ke liye koi scheme hai?",
+                             conversation_history=[], detected_language="hi"))
+                timings["llm_tool_call"] = t
+            except Exception as exc:                          # noqa: BLE001
+                print(f"  [ERROR] Tool call failed: {exc}")
+                timings["llm_tool_call"] = None
 
-        _, t = measure("Transcribe 2s audio (will be empty)", stt.transcribe, fake_audio, 48000)
-        timings["stt"] = t
+            await llm.close_client()
 
-    # ════════════════════════════════════════════════════
-    # 5. TTS (Cartesia) — requires API key
-    # ════════════════════════════════════════════════════
-    divider("5. TTS (Cartesia Sonic)")
+        # ════════════════════════════════════════════════
+        # 4. STT (Deepgram) — requires API key
+        # ════════════════════════════════════════════════
+        divider("4. STT (Deepgram Nova-3, batch — baseline only)")
 
-    if not settings.cartesia_api_key or settings.cartesia_api_key.startswith("xxx"):
-        print("  [SKIP] CARTESIA_API_KEY not set, skipping TTS test")
-        timings["tts_short"] = None
-        timings["tts_hindi"] = None
-    else:
-        from voice import tts
+        if not settings.deepgram_api_key or settings.deepgram_api_key.startswith("xxx"):
+            print("  [SKIP] DEEPGRAM_API_KEY not set, skipping STT test")
+            timings["stt"] = None
+        else:
+            import numpy as np
 
-        _, t = measure(
-            "Short English text",
-            tts.synthesize,
-            "Hello, I found 3 schemes for you.",
-        )
-        timings["tts_short"] = t
+            from voice import stt
 
-        _, t = measure(
-            "Hindi text",
-            tts.synthesize,
-            "Maine aapke liye 3 yojanaen dhundhi hain.",
-        )
-        timings["tts_hindi"] = t
+            # 2 seconds of noise. Transcribes to nothing; we are timing the
+            # round-trip, not the accuracy.
+            fake_audio = (np.random.randn(48000 * 2) * 100).astype(np.int16)
+            _, t = measure("Transcribe 2s audio (will be empty)",
+                           stt.transcribe, fake_audio, 48000)
+            timings["stt"] = t
+
+        # ════════════════════════════════════════════════
+        # 5. TTS (Cartesia) — requires API key
+        # ════════════════════════════════════════════════
+        divider("5. TTS (Cartesia Sonic, batch — baseline only)")
+
+        if not settings.cartesia_api_key or settings.cartesia_api_key.startswith("xxx"):
+            print("  [SKIP] CARTESIA_API_KEY not set, skipping TTS test")
+            timings["tts_short"] = None
+            timings["tts_hindi"] = None
+        else:
+            from voice import tts
+
+            _, t = measure("Short English text", tts.synthesize,
+                           "Hello, I found 3 schemes for you.")
+            timings["tts_short"] = t
+
+            _, t = measure("Hindi text", tts.synthesize,
+                           "Maine aapke liye 3 yojanaen dhundhi hain.")
+            timings["tts_hindi"] = t
+    finally:
+        # Close the Postgres pool and Qdrant client, or asyncpg complains on exit.
+        await res.close()
 
     # ════════════════════════════════════════════════════
     # Summary
@@ -191,8 +226,7 @@ def main():
         else:
             print(f"  {label:<35s}  {val:>8.1f} ms")
 
-    # Estimate full roundtrip
-    stt_t = timings.get("stt") or 400  # estimate if skipped
+    stt_t = timings.get("stt") or 400        # estimate if skipped
     llm_t = timings.get("llm_tool_call") or 1500
     tts_t = timings.get("tts_short") or 300
 
@@ -209,4 +243,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

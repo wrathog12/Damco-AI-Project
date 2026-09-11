@@ -6,6 +6,13 @@ The SDK handles authentication, protocol details, and retries internally.
 
 Uses language="multi" for multilingual support (Hindi, English, Bengali,
 Marathi, Hinglish) without needing explicit language detection.
+
+**Benchmark only.** The live pipeline uses Pipecat's streaming
+`DeepgramSTTService` (see `voice/pipeline.py`); this batch-upload path is kept
+because `test.py` is the repo's only per-stage timing tool and P5 compares
+against the numbers it produced before the migration. Do not wire it back into
+the voice loop — uploading a whole WAV after the caller stops talking is exactly
+the latency P2 removed.
 """
 import io
 import wave

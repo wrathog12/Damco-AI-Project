@@ -33,13 +33,15 @@ def check_settings() -> bool:
     print(f"  transport       {settings.transport}")
     print(f"  cors_origins    {settings.cors_origins}")
     print(f"  llm_model       {settings.llm_model}")
+    print(f"  embedding_model {settings.embedding_model} ({settings.embedding_dim}d)")
 
     ok = True
-    kb = Path(settings.kb_path)
-    print(f"  kb_path         {'OK' if kb.exists() else 'MISSING'} - {kb}")
-    ok &= kb.exists()
 
-    for name in ("groq_api_key", "deepgram_api_key", "cartesia_api_key"):
+    # `gemini_api_key` authenticates the LLM *and* the embeddings, so a missing
+    # one takes down both the conversation and retrieval. It comes from the
+    # repo-root .env, unlike the other two, which is exactly the mistake this
+    # check exists to catch.
+    for name in ("gemini_api_key", "deepgram_api_key", "cartesia_api_key"):
         present = bool(getattr(settings, name))
         print(f"  {name:<15} {'set' if present else 'NOT SET'}")
         ok &= present
