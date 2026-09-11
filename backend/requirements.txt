@@ -10,3 +10,10 @@ websockets>=13.0
 numpy>=1.26.0
 fastrtc[vad]>=0.0.20
 gradio>=5.0.0
+
+# ── Data layer (P0/P1) ──────────────────────────────────
+sqlalchemy[asyncio]>=2.0.36
+asyncpg>=0.30.0
+psycopg2-binary>=2.9.10   # sync driver, used only by Alembic
+alembic>=1.14.0
+qdrant-client>=1.12.0

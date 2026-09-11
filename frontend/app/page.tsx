@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import VoiceOrb from "./components/VoiceOrb";
 import SchemeCard from "./components/SchemeCard";
+import { apiUrl, wsUrl } from "@/lib/config";
 
 type Status = "standby" | "listening" | "processing" | "speaking";
 
@@ -44,7 +45,7 @@ export default function Home() {
     const connect = () => {
       if (!isMounted) return;
 
-      ws = new WebSocket("ws://localhost:8000/ws/cards");
+      ws = new WebSocket(wsUrl("/ws/cards"));
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -156,7 +157,7 @@ export default function Home() {
       });
 
       // Send offer to backend
-      const response = await fetch("http://localhost:8000/rtc/webrtc/offer", {
+      const response = await fetch(apiUrl("/rtc/webrtc/offer"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

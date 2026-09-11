@@ -79,10 +79,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS for frontend
+# CORS for frontend.
+# Origins come from config (CORS_ORIGINS) — a wildcard is invalid alongside
+# allow_credentials=True, and credentialed requests are needed from P3 onward.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

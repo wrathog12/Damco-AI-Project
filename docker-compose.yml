@@ -1,0 +1,63 @@
+# ══════════════════════════════════════════════════════════
+#  Bhasha-Agent — local infrastructure
+#
+#  Postgres is the canonical store for schemes + user data.
+#  Qdrant is the derived hybrid (dense + sparse) search index.
+#
+#  Usage:
+#    docker compose up -d
+#    docker compose ps          # both should read "healthy"
+#    docker compose down        # keeps volumes
+#    docker compose down -v     # wipes data
+# ══════════════════════════════════════════════════════════
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: bhasha-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bhasha}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bhasha}
+      POSTGRES_DB: ${POSTGRES_DB:-bhasha}
+      # Deterministic collation so ORDER BY is stable across machines.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bhasha} -d ${POSTGRES_DB:-bhasha}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: bhasha-qdrant
+    restart: unless-stopped
+    environment:
+      # Deliberately no QDRANT__SERVICE__API_KEY here. Setting that variable at
+      # all — even to an empty string — turns auth ON, and every request then
+      # fails with 401 "Must provide an API key". The container is bound to
+      # localhost, so it runs open; QDRANT_API_KEY in .env is for a *remote*
+      # Qdrant (e.g. Qdrant Cloud) and is read by backend/config.py only.
+      QDRANT__LOG_LEVEL: INFO
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"   # REST + dashboard at /dashboard
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      # The Qdrant image is distroless — no curl, no wget, no shell utils.
+      # It does ship its own binary, which can probe the local REST API.
+      test: ["CMD", "/qdrant/qdrant", "--version"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  postgres_data:
+  qdrant_data:

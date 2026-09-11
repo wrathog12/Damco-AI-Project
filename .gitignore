@@ -3,11 +3,10 @@
 # ══════════════════════════════════════════════════════════
 
 # ── Environment Variables ─────────────────────────────────
+# Real secrets stay local; *.env.example templates are tracked.
 .env
 .env.local
-.env.example
-# Keep the backend .env.example as a template for contributors
-!backend/.env.example
+.env.*.local
 
 # ── All .md files EXCEPT root README.md ───────────────────
 *.md
@@ -40,21 +39,36 @@ node_modules/
 !.yarn/releases
 !.yarn/versions
 
-# ── Scraper Code (not part of the main application) ──────
+# ── Ingestion pipeline (root) ────────────────────────────
+# Still untracked pending the P1.a rewrite, after which it becomes a real
+# ingestion service and these entries should be removed so it is versioned.
 /batch_scraper.py
-/collect_urls.py
 /collect_urls_smart.py
-/manual_scraper.py
-/scraper.py
-/schema.py
 /urls_to_scrape.txt
 /utils/
-/tests/
 /requirements.txt
 
-# ── Scraped Data — raw & processed intermediaries ────────
-scraped_data/raw/
-scraped_data/processed/
+# ── Quarantined dead code, pending confirmed deletion ────
+/_archive/
+
+# ── Scraped Data — entire directory ──────────────────────
+# All scraped data (raw, processed, api, spike, logs, JSON dumps).
+# Postgres is the canonical store; these are only staging artifacts.
+scraped_data/
+
+# ── Data files (JSON, CSV, log) ──────────────────────────
+# Ignore all JSON data files globally except frontend config files.
+*.json
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/tsconfig.json
+!frontend/components.json
+
+# Log files
+*.log
+
+# ── Harvested credentials cache (x-api-key) ──────────────
+/.cache/
 
 # ── Test Outputs ──────────────────────────────────────────
 test_*.txt

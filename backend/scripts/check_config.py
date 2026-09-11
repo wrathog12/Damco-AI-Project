@@ -1,0 +1,117 @@
+"""
+Smoke-check the configuration and infrastructure wiring.
+
+Prints resolved (non-secret) settings and probes Postgres + Qdrant.
+Run from anywhere:  python backend/scripts/check_config.py
+"""
+import asyncio
+import sys
+from pathlib import Path
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from config import settings  # noqa: E402
+
+
+def _redact(url: str) -> str:
+    """Hide the password in a DSN before printing it."""
+    if "://" not in url or "@" not in url:
+        return url
+    scheme, rest = url.split("://", 1)
+    creds, host = rest.rsplit("@", 1)
+    user = creds.split(":", 1)[0]
+    return f"{scheme}://{user}:***@{host}"
+
+
+def check_settings() -> bool:
+    print("-- Settings -------------------------------------")
+    print(f"  database_url    {_redact(settings.database_url)}")
+    print(f"  qdrant_url      {settings.qdrant_url}")
+    print(f"  qdrant_coll     {settings.qdrant_collection}")
+    print(f"  transport       {settings.transport}")
+    print(f"  cors_origins    {settings.cors_origins}")
+    print(f"  llm_model       {settings.llm_model}")
+
+    ok = True
+    kb = Path(settings.kb_path)
+    print(f"  kb_path         {'OK' if kb.exists() else 'MISSING'} - {kb}")
+    ok &= kb.exists()
+
+    for name in ("groq_api_key", "deepgram_api_key", "cartesia_api_key"):
+        present = bool(getattr(settings, name))
+        print(f"  {name:<15} {'set' if present else 'NOT SET'}")
+        ok &= present
+
+    if settings.jwt_secret == "dev-only-insecure-change-me":
+        print("  jwt_secret      default (fine locally, must change to deploy)")
+    else:
+        print("  jwt_secret      set")
+
+    return bool(ok)
+
+
+async def check_postgres() -> bool:
+    print("\n-- Postgres -------------------------------------")
+    try:
+        from sqlalchemy import text
+
+        from db import dispose_engine, session_scope
+
+        async with session_scope() as session:
+            version = (await session.execute(text("SELECT version()"))).scalar_one()
+            # `alembic_version` does not exist until the first upgrade runs, and
+            # that is a normal state — not an error. to_regclass returns NULL
+            # instead of raising, which would otherwise abort the transaction.
+            table_exists = (
+                await session.execute(text("SELECT to_regclass('alembic_version')"))
+            ).scalar_one() is not None
+            revision = (
+                (await session.execute(text("SELECT version_num FROM alembic_version")))
+                .scalars()
+                .all()
+                if table_exists
+                else []
+            )
+        await dispose_engine()
+        print(f"  connected: {version.split(',')[0]}")
+        print(f"  alembic revision: {revision or 'none applied yet (run: alembic upgrade head)'}")
+        return True
+    except Exception as e:
+        print(f"  FAILED: {type(e).__name__}: {e}")
+        print("  -> is `docker compose up -d` running?")
+        return False
+
+
+def check_qdrant() -> bool:
+    print("\n-- Qdrant ---------------------------------------")
+    try:
+        from qdrant_client import QdrantClient
+
+        client = QdrantClient(
+            url=settings.qdrant_url,
+            api_key=settings.qdrant_api_key or None,
+        )
+        names = [c.name for c in client.get_collections().collections]
+        print(f"  connected: {settings.qdrant_url}")
+        print(f"  collections: {names or 'none yet'}")
+        return True
+    except Exception as e:
+        print(f"  FAILED: {type(e).__name__}: {e}")
+        print("  -> is `docker compose up -d` running?")
+        return False
+
+
+async def main() -> int:
+    results = [check_settings(), await check_postgres(), check_qdrant()]
+    print()
+    if all(results):
+        print("All checks passed.")
+        return 0
+    print("Some checks failed - see above.")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(main()))
