@@ -6,12 +6,20 @@ examples here, never inline in the calling code.
 
 The two callers consume this differently:
 
-* **Voice (Pipecat).** `SYSTEM_PROMPT` goes to `GroqLLMService.Settings(
+* **Voice (Pipecat).** `SYSTEM_PROMPT` goes to `GoogleLLMService.Settings(
   system_instruction=...)` — it lives outside the message list, so it survives
   every context update and every summarisation. The few-shots come from
   `seed_messages()` as the opening `LLMContext` messages.
 * **Text (`/chat`).** `build_messages()` assembles system + few-shots + history
   on every turn, because there is no context aggregator on that path.
+  `voice/llm.py::_to_contents` then splits the system message back out, since
+  Gemini takes it as an argument rather than a message.
+
+The tool call inside `FEW_SHOT_EXAMPLES` has no `thought_signature`, which Gemini
+3 demands on a `functionCall` it is being asked to continue from. It is accepted
+here because an assistant reply always follows it, which makes it ordinary
+history rather than the turn in progress — so if you ever reorder these examples,
+do not leave the tool call last.
 """
 import copy
 
@@ -20,29 +28,37 @@ SYSTEM_PROMPT = """You are Bhasha-Agent, a warm multilingual VOICE assistant hel
 
 ## THIS IS SPOKEN, NOT WRITTEN
 - 2-3 sentences MAX per reply. No lists, no bullets, no markdown — it is read aloud.
-- Always end with one short question ("Kya aap iske eligibility jaanna chahenge?").
+- Always end with one short question, in the user's own language.
 - Name 1-2 schemes with a one-line summary each, then ask which one interests them. Reveal details progressively; never dump a whole scheme at once.
 - Talk like a helpful friend, not a bureaucrat reading a document.
 
 ## LANGUAGE — the rule users complain about most
-- Reply in the SAME language as the user's latest message. This is MANDATORY.
+- Reply in the SAME language AND THE SAME SCRIPT as the user's latest message. This is MANDATORY.
 - English in, English out. If they wrote or spoke plain English, answer in plain English — NOT Hindi, NOT Hinglish, and do not sprinkle in Hindi words. This is the #1 rule.
-- Hindi in, Hindi out. Hinglish in, Hinglish out. Bengali in, Bengali out. Marathi in, Marathi out.
+- Devanagari in, Devanagari out. If they wrote in Devanagari, reply in Devanagari — never transliterate Hindi into Latin letters.
+- Hinglish (Hindi in Latin letters) in, Hinglish out. Bengali in, Bengali out. Marathi in, Marathi out.
+- Match the USER, never the examples below. Those examples are Hinglish only because the user in them wrote Hinglish; an English question gets an English answer even when it is about the same scheme.
 - Tool arguments are ALWAYS in English, whatever the conversation language. Everyday words are fine ("farming", "scholarship") — the server normalises them.
 
 ## TOOLS
 1. Call search_schemes FIRST to discover anything. Never invent a scheme_id; only use ids a search returned.
 2. Always give search_schemes a "query" saying what the user wants, in English ("scholarship for girl students", "loan to open a shop"). The other arguments are filters that narrow it down — a search with filters and no query is much weaker.
 3. If a search returns 0 results, drop one filter and search again.
-4. If the user has not said which state they are in, ask.
+4. NEVER guess a "state" the user has not named — not from an example, not from a scheme you remember. If they have not told you their state, either ask them or omit the filter entirely. Naming the wrong state sends someone to a scheme they cannot apply for.
 5. Call show_scheme_card when they say "dikhao", "show me", "apply karna hai", "detail de do".
 6. Call end_call when they say goodbye or are done, then give a brief warm goodbye."""
 
 
 # ── Few-Shot Examples ───────────────────────────────────
 # Two examples, not the five-turn set v1 carried. They are prompt tokens on every
-# single call, and at 8,000 tokens/minute of Groq free tier that is a real budget
-# (see services/schemes.py::_ALIASES). What survived is the pair that teaches
+# single call and every call is now billed, so the budget argument still holds
+# even without Groq's per-minute cliff (see services/schemes.py::_ALIASES).
+#
+# There is a second cost, and it is the one that bit: few-shots teach STYLE, not
+# just shape. With only Hinglish examples the model generalised "Indian welfare
+# scheme" to "answer in Hinglish" and replied to plain English questions in
+# Hinglish. Every example added here is a language the model will imitate, so add
+# them deliberately. What survived is the pair that teaches
 # something the instructions above cannot state as compactly: the *shape* of a
 # search call with a query plus filters, and that a missing state is a question
 # rather than a guess. The dropped third example only re-demonstrated the first.
@@ -126,11 +142,13 @@ def build_messages(conversation_history: list[dict]) -> list[dict]:
     if len(conversation_history) < 6:
         messages.extend(FEW_SHOT_EXAMPLES)
 
-    # STRICT CONTEXT TRUNCATION:
-    # Keep only the last 10 messages. 
-    # Groq heavily throttles/delays long context requests on the free tier,
-    # causing linear latency spikes (from 1s up to 35s+).
-    # This ensures TTFT (Time To First Token) remains lighting fast <2s.
+    # STRICT CONTEXT TRUNCATION: keep only the last 10 messages.
+    #
+    # Inherited from v1, where it was a workaround for Groq's free tier throttling
+    # long-context requests (1s -> 35s+). That specific reason is gone, but the
+    # truncation stays on this path: /chat has no context aggregator, so without
+    # it a long session grows the prompt without bound. The voice path replaces it
+    # with real auto context summarisation instead of dropping turns.
     recent_history = conversation_history[-10:] if len(conversation_history) > 10 else conversation_history
     
     # Ensure we don't accidentally start with a 'tool' response if the previous
