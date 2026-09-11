@@ -97,11 +97,13 @@ _STOP_TOKENS = {"and", "of", "the", "scheme", "schemes", "department",
 # shares none with "Farmer".
 #
 # v1 taught these to the model as a 40-line table inside the system prompt. That
-# cost ~600 tokens on *every* call, and Groq's free tier allows 8,000 tokens a
-# minute — so a single three-round turn spent the entire minute's budget and the
-# next call was throttled 24-44s with no error anywhere in the logs. Resolving
-# them here is free, is deterministic, and cannot drift out of step with the
-# corpus the way a prompt table does (see `_canonicalise`).
+# cost ~600 tokens on *every* call — and on the then-current Groq free tier of
+# 8,000 tokens/minute, a single three-round turn spent the whole minute's budget
+# and the next call was throttled 24-44s with no error anywhere in the logs.
+# Billing is pay-as-you-go on Gemini now so the cliff is gone, but the tokens are
+# not free and the argument still holds: resolving them here is deterministic,
+# and cannot drift out of step with the corpus the way a prompt table does (see
+# `_canonicalise`).
 #
 # Keyed per field, which the prompt table was not: "student" means the Education
 # category when it arrives as `category` and the string "Student" when it arrives

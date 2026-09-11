@@ -26,7 +26,9 @@ class Settings(BaseSettings):
     )
 
     # ── API Keys ────────────────────────────────────────
-    groq_api_key: str = ""
+    # The LLM's key is `gemini_api_key` below, not here: it is shared with the
+    # embeddings and lives in the repo-root .env, while these two are the
+    # backend's own.
     deepgram_api_key: str = ""
     cartesia_api_key: str = ""
 

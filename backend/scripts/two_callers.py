@@ -10,7 +10,7 @@ works" but "two callers are independent".
 This script connects two real WebRTC peers to a running server, speaks a
 *different* question into each, and then checks that neither caller's stream ever
 mentions the other caller's state. It needs Cartesia (to synthesise the two
-utterances), Deepgram and Groq — it is a live end-to-end test, not a unit test.
+utterances), Deepgram and Gemini — it is a live end-to-end test, not a unit test.
 
     python main.py                        # in one shell
     python scripts/two_callers.py         # in another

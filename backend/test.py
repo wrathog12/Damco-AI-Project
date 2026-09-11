@@ -134,12 +134,14 @@ async def main():
         print(f"  -> eligible: {result.get('eligible')}")
 
         # ════════════════════════════════════════════════
-        # 3. LLM (Groq) — requires API key
+        # 3. LLM (Google AI) — requires API key
         # ════════════════════════════════════════════════
-        divider(f"3. LLM (Groq {settings.llm_model})")
+        divider(f"3. LLM (Google AI {settings.llm_model})")
 
-        if not settings.groq_api_key or settings.groq_api_key.startswith("gsk_xxx"):
-            print("  [SKIP] GROQ_API_KEY not set, skipping LLM test")
+        # Read from the *repo-root* .env, unlike the Deepgram and Cartesia keys
+        # below — it is the same key the embeddings above already used.
+        if not settings.gemini_api_key:
+            print("  [SKIP] GEMINI_API_KEY not set, skipping LLM test")
             timings["llm_simple"] = None
             timings["llm_tool_call"] = None
         else:

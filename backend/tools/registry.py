@@ -26,6 +26,8 @@ from typing import Any, Awaitable, Callable
 from loguru import logger
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter
 from pipecat.services.llm_service import FunctionCallParams
 
 from services.resources import Resources
@@ -270,12 +272,18 @@ TOOL_SCHEMAS: list[FunctionSchema] = [
 
 TOOL_NAMES = tuple(s.name for s in TOOL_SCHEMAS)
 
-# The same five schemas in the wire format the Groq/OpenAI SDK wants. `/chat`
-# talks to Groq directly (no Pipecat pipeline), so it needs these — but derived
-# from `TOOL_SCHEMAS`, never hand-maintained alongside it.
-OPENAI_TOOL_SCHEMAS: list[dict[str, Any]] = [
-    {"type": "function", "function": s.to_default_dict()} for s in TOOL_SCHEMAS
-]
+# The same five schemas as Gemini `functionDeclarations`. `/chat` calls the
+# google-genai SDK directly rather than through a Pipecat pipeline, so it needs
+# the provider format — but *derived* from `TOOL_SCHEMAS`, never hand-maintained
+# alongside it, which is the whole point of this module.
+#
+# Converted with Pipecat's own adapter rather than by hand: it is what the voice
+# path uses, so the two paths cannot advertise subtly different tools. It also
+# does the JSON-Schema-to-Gemini adaptations that are easy to miss — Gemini
+# rejects several keywords the OpenAI format allows.
+GEMINI_TOOLS: list[dict[str, Any]] = GeminiLLMAdapter().to_provider_tools_format(
+    ToolsSchema(standard_tools=list(TOOL_SCHEMAS))
+)
 
 # The advertised tools and the executable ones drifting apart is a silent
 # failure: the LLM calls something that returns "Unknown tool", or a tool exists

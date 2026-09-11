@@ -16,7 +16,8 @@ final text. Run it on both builds and read the two files side by side.
     python backend/scripts/chat_query_set.py --out after.json
     python backend/scripts/chat_query_set.py --compare before.json after.json
 
-Needs GROQ_API_KEY. The v2 build also needs Postgres, Qdrant and GEMINI_API_KEY.
+Needs GEMINI_API_KEY (the LLM and the embeddings share it), plus Postgres and
+Qdrant up.
 """
 import argparse
 import asyncio
