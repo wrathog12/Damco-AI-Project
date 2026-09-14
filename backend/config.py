@@ -63,11 +63,45 @@ class Settings(BaseSettings):
     qdrant_api_key: str = ""
     qdrant_collection: str = "schemes"
 
-    # ── Auth (used from P3; declared now so config stays in one place) ──
+    # ── Auth ────────────────────────────────────────────
+    # `jwt_secret` also signs the anonymous-identity cookie (see auth/anon.py),
+    # so rotating it logs everyone out AND resets every anonymous quota. That is
+    # the correct trade — a leaked secret lets anyone mint unlimited free turns —
+    # but it means rotation is a deliberate act, not a routine one.
     jwt_secret: str = "dev-only-insecure-change-me"
     jwt_algorithm: str = "HS256"
     access_token_ttl_minutes: int = 15
     refresh_token_ttl_days: int = 30
+
+    # ── Quota (anonymous-first access) ──────────────────
+    # The product decision behind this: there is NO login wall. A first-time
+    # caller talks to the agent immediately, because the audience is welfare
+    # recipients on cheap phones and an OTP screen before any value is delivered
+    # loses most of them. Login is what you do when you want *more*, not what you
+    # do to start.
+    #
+    # Counted in conversation TURNS, not minutes or sessions. A turn is one
+    # user utterance that reaches the LLM. Minutes would track cost more closely
+    # (Deepgram, Cartesia and Gemini all bill by audio duration) — that is a known
+    # trade, taken because turns are the unit a user can actually understand from
+    # a spoken sentence, and because it is enforceable without the pipeline having
+    # to report session duration on close.
+    #
+    # Both are per rolling window, per identity. Tune freely: they are the two
+    # numbers most likely to change once there is real usage.
+    anon_turn_quota: int = 10
+    user_turn_quota: int = 100
+    # The window these reset over. A rolling window, not a calendar day, so a
+    # caller at 23:55 does not get a fresh allowance five minutes later.
+    quota_window_hours: int = 24
+    # Name of the anonymous-identity cookie. httpOnly and signed — see auth/anon.py.
+    anon_cookie_name: str = "bh_anon"
+    # Anonymous ids are cheap to mint and a caller who clears cookies gets a new
+    # one. That is accepted: the free allowance is small enough that evading it is
+    # more effort than logging in, and the alternative (keying quota on IP) makes
+    # a personal identifier out of something DPDP then obliges us to justify,
+    # disclose and expire — for a bucket of ten turns.
+    anon_cookie_ttl_days: int = 365
 
     # ── Voice transport ─────────────────────────────────
     # Keeps the hosting decision open: swap without touching pipeline code.
