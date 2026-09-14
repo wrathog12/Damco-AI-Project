@@ -114,6 +114,60 @@ GREETING = (
 )
 
 
+# ── Quota ───────────────────────────────────────────────
+# `voice/quota_gate.py` injects these two as one-turn `system` messages rather
+# than adding them to SYSTEM_PROMPT, because each is true for exactly one turn.
+# "You are out of turns" carried in the instruction would be spoken on a call
+# where it is not true, and the model cannot be told to forget it.
+#
+# The instruction is in English while the *reply* must be in the caller's
+# language: that split is the point. Pre-translating a refusal into ten languages
+# would drift from the corpus and from each other, and the model is already
+# holding the LanguageTagger's note about which language the caller is using —
+# so the one place that knows the language is the one asked to write the sentence.
+
+def quota_last_turn_notice(authenticated: bool) -> str:
+    """Injected on the turn that is granted *last*, so the caller is warned while
+    still being answered. Being cut off with no notice is what users experience as
+    broken; the limit itself they accept."""
+    ask = ("they can continue after a short wait" if authenticated else
+           "signing in with their phone number will give them many more")
+    return ("System notice: this is the user's last available turn for now. "
+            "Answer their question normally, then add ONE short sentence, in the "
+            f"user's own language, saying this was their last turn and that {ask}. "
+            "Do not apologise and do not explain how the limit works.")
+
+
+def quota_exhausted_instruction(authenticated: bool) -> str:
+    """Injected in place of an answer once the allowance is gone.
+
+    The gate also strips the tools off the context before this runs, so "do not
+    look anything up" is enforced rather than merely requested — the model has no
+    tool to call. Saying it anyway keeps the model from promising to.
+    """
+    offer = ("they can continue after a short wait" if authenticated else
+             "if they sign in with their phone number they will get many more")
+    return ("System notice: the user has no turns left, so their last question "
+            "cannot be answered. Do not answer it, do not look anything up and "
+            "do not promise to. In the user's own language, say only this in two "
+            f"short sentences: their turns are finished for now, and {offer}. "
+            "Then give a brief warm goodbye.")
+
+
+def quota_exhausted_greeting(authenticated: bool) -> str:
+    """Spoken instead of `GREETING` when the allowance is already gone at connect.
+
+    English, unlike the two above, and not a model call: nothing has been said
+    yet, so there is no language to match and no context to reply into. Telling
+    someone up front beats greeting them warmly and then refusing their question.
+    """
+    if authenticated:
+        return ("Hello! You have used all your turns for now. They will refresh "
+                "shortly — please call back a little later. Thank you!")
+    return ("Hello! You have used your free turns for now. Please sign in with "
+            "your phone number to keep talking and get many more. Thank you!")
+
+
 def seed_messages() -> list[dict]:
     """The opening `LLMContext` messages for a voice session.
 

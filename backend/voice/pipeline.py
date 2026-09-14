@@ -22,7 +22,7 @@ needed. Worth being explicit about what is gone, because each one was a real bug
 
 The pipeline:
 
-    transport.input → STT → LanguageTagger → user aggregator
+    transport.input → STT → LanguageTagger → user aggregator → QuotaGate
                     → LLM → TTS → transport.output → CallCloser
                     → assistant aggregator
 
@@ -62,10 +62,18 @@ from pipecat.services.google.llm import GoogleLLMService, GoogleLLMSettings
 from pipecat.workers.runner import WorkerRunner
 
 from config import settings as cfg
+from models.identity import User
+from services import quota
 from services.resources import Resources
 from tools.end_call import END_EVENT
 from tools.registry import TOOL_SCHEMAS, ToolContext
-from voice.prompts import GREETING, SYSTEM_PROMPT, seed_messages
+from voice.prompts import (
+    GREETING,
+    SYSTEM_PROMPT,
+    quota_exhausted_greeting,
+    seed_messages,
+)
+from voice.quota_gate import QuotaGate
 from voice.transport import create_transport
 
 # Deepgram's language code → the name to put in front of the user's words.
@@ -84,6 +92,10 @@ _LANGUAGE_NAMES = {
     "ml": "Malayalam",
     "pa": "Punjabi",
 }
+
+# RTVI server-message type for the turn allowance. Named here, next to the only
+# place that sends it, the way CARD_EVENT and END_EVENT live next to their tools.
+QUOTA_EVENT = "quota"
 
 # Languages the Cartesia voice can be switched to mid-call. Anything else keeps
 # the current setting rather than sending Cartesia a code it will reject.
@@ -224,6 +236,7 @@ def _build_services() -> tuple[DeepgramSTTService, GoogleLLMService, CartesiaTTS
 async def run_session(
     resources: Resources,
     *,
+    user: User,
     webrtc_connection: Any | None = None,
     conversation_id: str | None = None,
 ) -> None:
@@ -232,6 +245,12 @@ async def run_session(
     `resources` is the process-wide pool handed in from the FastAPI lifespan —
     shared deliberately, because a connection pool per caller would exhaust
     Postgres. Everything else in here is built fresh per session.
+
+    `user` is whoever `POST /api/offer` resolved — anonymous or authenticated,
+    resolved there rather than here because that is the request that carries the
+    cookie. It is a detached ORM row and is read, not refreshed: only `id` and
+    `phone_e164` are used, and the live counter is read inside the same statement
+    that increments it (see `services/quota.py`).
     """
     conversation_id = conversation_id or str(uuid.uuid4())
     log = logger.bind(call=conversation_id[:8])
@@ -257,6 +276,10 @@ async def run_session(
 
     tagger = LanguageTagger()
     closer = CallCloser()
+    # The meter sits in front of the LLM, so a turn is counted where it is spent.
+    # `closer.arm` is handed over rather than looked up: the gate ends the call the
+    # same way `end_call` does, after the last sentence is actually spoken.
+    gate = QuotaGate(resources=resources, user=user, on_exhausted=closer.arm)
 
     # `deliver` is filled in below — the callback needs the worker, and the
     # worker needs this object as its app_resources.
@@ -267,6 +290,7 @@ async def run_session(
         stt,
         tagger,
         aggregators.user(),
+        gate,
         llm,
         tts,
         transport.output(),
@@ -309,6 +333,22 @@ async def run_session(
             # the handler itself would deadlock: pipeline start waits on
             # transport start, which waits on this handler.
             await running.wait()
+
+            # Everything below is after `running`, RTVI message included. Sending
+            # one before the pipeline has started does not merely get dropped like
+            # a queued frame — it blocks, and the worker gives up with "timeout
+            # setting the pipeline up" ~20s later, so the caller hears nothing at
+            # all. `peek`, not `consume`: finding out whether a turn is available
+            # must not spend one, and the greeting never reaches the LLM anyway.
+            allowance = await quota.peek(resources, user)
+            # One event at connect so a client can render the allowance without a
+            # second request. It goes stale as the call proceeds — pushing an
+            # update per turn belongs with the UI that would display it, in P4.
+            await deliver({"type": QUOTA_EVENT,
+                           "remaining": allowance.remaining,
+                           "limit": allowance.limit,
+                           "authenticated": allowance.authenticated})
+
             # A fixed greeting rather than an LLM turn: it is instant, always in
             # the right words, and the model cannot decide to open with
             # something else.
@@ -318,6 +358,16 @@ async def run_session(
             # appending it here as well put the greeting in twice, which is how
             # the first draft of this ended up with a context whose last two
             # messages were identical.
+            if not allowance.allowed:
+                # Say so up front rather than greeting warmly and then refusing
+                # the first question. Arming the closer here ends the call once
+                # this sentence is out, so the caller is not left holding an open
+                # line they cannot use.
+                log.info(f"no turns left at connect (user={user.id}), closing")
+                closer.arm()
+                await worker.queue_frames([TTSSpeakFrame(
+                    quota_exhausted_greeting(allowance.authenticated))])
+                return
             await worker.queue_frames([TTSSpeakFrame(GREETING)])
 
         worker.create_task(greet(), name="greeting")
