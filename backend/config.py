@@ -113,6 +113,44 @@ class Settings(BaseSettings):
     msg91_auth_key: str = ""
     msg91_template_id: str = ""
 
+    # ── Profiles and memory (DPDP Act 2023) ─────────────
+    # Deliberately no default, unlike `jwt_secret`. With this unset nothing
+    # personal is stored at all: profiles refuse to save and transcripts are not
+    # recorded. A well-known signing secret costs free turns; a well-known
+    # *encryption* key means a database of caste and income that is encrypted in
+    # form and public in fact, so refusing to collect is the safe failure. It is
+    # also deliberately separate from `jwt_secret` — rotating that logs everyone
+    # out, and coupling the two would make an ordinary logout-everyone rotation
+    # destroy every stored profile. See auth/crypto.py.
+    #
+    #   python -c "import secrets; print(secrets.token_urlsafe(48))"
+    profile_encryption_key: str = ""
+    # Bumped when the privacy notice changes, which requires every user to consent
+    # again before their profile can be written to. Stored on the user row *and*
+    # on the profile, so it is answerable which policy any given fact was
+    # collected under.
+    consent_version: str = "2026-09-1"
+
+    # ── Retention ───────────────────────────────────────
+    # "We delete old data" is a promise; a scheduled DELETE is a fact. The sweep
+    # lives in services/retention.py and runs from the app's lifespan, so there is
+    # no deployment where someone forgot to install a cron job.
+    #
+    # Transcripts go first and fastest — they are the most revealing thing here and
+    # the least structured. Ninety days is long enough that a caller returning next
+    # month is remembered and short enough that a leak is bounded.
+    conversation_retention_days: int = 90
+    # Which schemes someone looked at lives longer: it is the memory that makes a
+    # second call better than a first, and it holds no sensitive category.
+    interaction_retention_days: int = 365
+    # Abandoned anonymous rows — a cookie cleared, a browser never reopened. This
+    # is the prune `models/identity.py` promised when it accepted one dead row per
+    # login on a new device. Only rows with no phone number are ever touched.
+    anon_prune_days: int = 90
+    # How often the sweep runs. Daily: the windows above are in days, so anything
+    # finer only adds wake-ups.
+    retention_sweep_hours: int = 24
+
     # ── Quota (anonymous-first access) ──────────────────
     # The product decision behind this: there is NO login wall. A first-time
     # caller talks to the agent immediately, because the audience is welfare

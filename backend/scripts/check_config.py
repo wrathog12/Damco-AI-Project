@@ -60,6 +60,29 @@ def check_settings() -> bool:
     else:
         print("  jwt_secret      set")
 
+    # No default on purpose (see auth/crypto.py): with this unset, profiles and
+    # transcripts are not stored at all. That is the safe failure, but it is a
+    # silent one from the outside — the app answers every request normally and
+    # simply remembers nothing — so it is reported here rather than only warned
+    # about once at startup.
+    from auth import crypto  # local: importing it derives and caches the key
+
+    if crypto.available():
+        # A fingerprint, never the key. Six hex characters is enough to tell "the
+        # key changed" from "the data is corrupt" and useless to anyone else.
+        print(f"  profile_key     set (fingerprint {crypto.fingerprint()}, "
+              f"{len(settings.profile_encryption_key.encode())} bytes)")
+    else:
+        print("  profile_key     NOT SET — profiles and transcripts are not "
+              "stored")
+        print("                  set PROFILE_ENCRYPTION_KEY to enable "
+              "(`python -c \"import secrets;print(secrets.token_urlsafe(48))\"`)")
+    print(f"  consent_version {settings.consent_version}")
+    print(f"  retention       transcripts {settings.conversation_retention_days}d, "
+          f"interactions {settings.interaction_retention_days}d, "
+          f"anon ids {settings.anon_prune_days}d, "
+          f"sweep every {settings.retention_sweep_hours}h")
+
     print(f"  otp_provider    {settings.otp_provider}")
     if settings.otp_dev_echo:
         # Loud, because with the stub provider this hands a code to anyone who

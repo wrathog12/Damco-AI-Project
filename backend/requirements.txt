@@ -38,3 +38,14 @@ qdrant-client>=1.12.0
 # No `phonenumbers`: E.164 normalisation in auth/phone.py covers Indian mobiles,
 # which is the audience. Add it the moment a second country matters.
 PyJWT>=2.9.0
+
+# ── Encryption at rest (P3 slice 3) ─────────────────────
+# AES-256-GCM for `user_profiles.payload`, `messages.body` and
+# `eligibility_evaluations.reasons` (auth/crypto.py). Declared explicitly rather
+# than leaned on as a transitive dependency of PyJWT/qdrant-client: it is a
+# DPDP Act requirement, and a requirements file that does not say so would let a
+# dependency resolution drop it and take profiles offline silently.
+#
+# GCM rather than CBC or Fernet because it *authenticates*: an altered income
+# figure fails to decrypt instead of decrypting to plausible rubbish.
+cryptography>=43.0.0
