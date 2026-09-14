@@ -46,10 +46,28 @@ def check_settings() -> bool:
         print(f"  {name:<15} {'set' if present else 'NOT SET'}")
         ok &= present
 
+    # `jwt_secret` signs three things now: the anonymous cookie, the access JWT
+    # and the OTP code hashes. Rotating it therefore logs everyone out, resets
+    # every anonymous quota AND invalidates every code in flight.
     if settings.jwt_secret == "dev-only-insecure-change-me":
         print("  jwt_secret      default (fine locally, must change to deploy)")
+    elif len(settings.jwt_secret.encode()) < 32:
+        # PyJWT warns about this on every mint. RFC 7518 §3.2 wants a key at least
+        # as long as the hash output for HS256, and a short one is guessable.
+        print(f"  jwt_secret      set but only "
+              f"{len(settings.jwt_secret.encode())} bytes — use 32+ "
+              f"(`python -c \"import secrets;print(secrets.token_urlsafe(32))\"`)")
     else:
         print("  jwt_secret      set")
+
+    print(f"  otp_provider    {settings.otp_provider}")
+    if settings.otp_dev_echo:
+        # Loud, because with the stub provider this hands a code to anyone who
+        # asks for one — every account becomes takeable by phone number alone.
+        state = ("ACTIVE — codes are returned over HTTP"
+                 if settings.otp_provider == "stub"
+                 else "set but ignored (provider is not the stub)")
+        print(f"  otp_dev_echo    {state}")
 
     return bool(ok)
 

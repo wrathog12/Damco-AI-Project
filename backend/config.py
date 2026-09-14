@@ -70,8 +70,48 @@ class Settings(BaseSettings):
     # but it means rotation is a deliberate act, not a routine one.
     jwt_secret: str = "dev-only-insecure-change-me"
     jwt_algorithm: str = "HS256"
+    # Short, because an access token cannot be revoked — it is checked by
+    # signature alone, with no database read on the hot path. Fifteen minutes is
+    # the window in which a leaked one is useful; the refresh token is the thing
+    # that can actually be taken away.
     access_token_ttl_minutes: int = 15
     refresh_token_ttl_days: int = 30
+    # Rotated on every refresh and hashed at rest; see models/auth.py.
+    refresh_cookie_name: str = "bh_refresh"
+
+    # ── OTP login ───────────────────────────────────────
+    # Phone OTP rather than email/password: the audience is welfare recipients on
+    # cheap Android phones, most of whom have a number and no email they use.
+    #
+    # `stub` writes the code to the log instead of sending an SMS, which is what
+    # makes the login flow testable without spending money — every real provider
+    # charges per message. It is the default precisely so that forgetting to
+    # configure a provider fails loudly in development rather than silently
+    # sending nothing in production.
+    otp_provider: Literal["stub", "msg91"] = "stub"
+    otp_code_length: int = 6
+    # Five minutes: long enough for a slow SMS, short enough that a code seen on
+    # a lock screen is not a standing credential.
+    otp_ttl_seconds: int = 300
+    # Per challenge, not per phone — a wrong code burns one of five tries and the
+    # sixth invalidates the challenge outright, so a six-digit code cannot be
+    # walked through.
+    otp_max_attempts: int = 5
+    # Both are per phone number, and both exist because an SMS costs money: the
+    # cooldown stops an impatient caller, the window cap stops a script.
+    otp_resend_cooldown_seconds: int = 60
+    otp_max_sends_per_window: int = 5
+    otp_send_window_minutes: int = 60
+    # Returns the code in the HTTP response so a test script can complete a login
+    # without reading the log. Honoured **only** when `otp_provider == "stub"`, so
+    # turning it on against a real provider does nothing. Never enable in a
+    # deployment: it makes every account takeable by anyone who knows a number.
+    otp_dev_echo: bool = False
+
+    # MSG91 — chosen as the first real provider because it is Indian, prices in
+    # rupees and does not require a US entity. Empty until someone buys credit.
+    msg91_auth_key: str = ""
+    msg91_template_id: str = ""
 
     # ── Quota (anonymous-first access) ──────────────────
     # The product decision behind this: there is NO login wall. A first-time
