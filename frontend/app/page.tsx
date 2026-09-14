@@ -1,314 +1,178 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
-import VoiceOrb from "./components/VoiceOrb";
+import { useEffect, useState } from "react";
+import Link from "next/link";
+import { Keyboard, Mic, ShieldCheck, Sparkles } from "lucide-react";
 import SchemeCard from "./components/SchemeCard";
-import { apiUrl, wsUrl } from "@/lib/config";
+import TextChat from "./components/TextChat";
+import VoiceSession from "./components/VoiceSession";
+import LanguageSwitcher from "./components/LanguageSwitcher";
+import { Card } from "./components/ui/primitives";
+import { useLanguage, useSession } from "./providers";
+import { api } from "@/lib/api";
+import type { Health, ShowSchemeCardEvent } from "@/lib/types";
+import { cn } from "@/lib/cn";
 
-type Status = "standby" | "listening" | "processing" | "speaking";
-
-const STATUS_LABELS: Record<Status, string> = {
-  standby:    "Ready",
-  listening:  "Listening",
-  processing: "Processing",
-  speaking:   "Speaking",
-};
-
-const STATUS_SUBTITLES: Record<Status, string> = {
-  standby:    "Tap to start a conversation",
-  listening:  "I'm listening… go ahead",
-  processing: "Understanding your request…",
-  speaking:   "Here's what I found…",
-};
+type Mode = "talk" | "type";
 
 export default function Home() {
-  const [status, setStatus]        = useState<Status>("standby");
-  const [amplitude, setAmplitude]  = useState(0);
-  const [activeCard, setActiveCard] = useState<any>(null);
+  const { language } = useLanguage();
+  const { quota, ready } = useSession();
+  const [mode, setMode] = useState<Mode>("talk");
+  const [card, setCard] = useState<ShowSchemeCardEvent | null>(null);
+  const [health, setHealth] = useState<Health | null>(null);
 
-  // Mic / analyser refs
-  const streamRef    = useRef<MediaStream | null>(null);
-  const analyserRef  = useRef<AnalyserNode | null>(null);
-  const audioCtxRef  = useRef<AudioContext | null>(null);
-  const rafRef       = useRef<number>(0);
-  const wsRef        = useRef<WebSocket | null>(null);
-  const stopMicRef   = useRef<(() => void) | null>(null);
-  const pcRef        = useRef<RTCPeerConnection | null>(null);
-  const audioElRef   = useRef<HTMLAudioElement | null>(null);
-
-  /* ── WebSocket for Scheme Cards + Status ───────────── */
   useEffect(() => {
-    let reconnectTimer: NodeJS.Timeout | null = null;
-    let ws: WebSocket | null = null;
-    let isMounted = true;
-
-    const connect = () => {
-      if (!isMounted) return;
-
-      ws = new WebSocket(wsUrl("/ws/cards"));
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        console.log("[WS] Connected");
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-
-          if (data.type === "status_change" && data.status) {
-            console.log("[WS] Status:", data.status);
-            setStatus(data.status as Status);
-          } else if (data.type === "show_scheme_card" && data.scheme) {
-            console.log("[WS] Card:", data.scheme.scheme_name);
-            setActiveCard(data.scheme);
-          } else if (data.type === "end_call") {
-            console.log("[WS] Call ended:", data.reason);
-            setTimeout(() => {
-              stopMicRef.current?.();
-            }, 2000);
-          }
-        } catch (err) {
-          console.error("[WS] Parse error:", err);
-        }
-      };
-
-      ws.onerror = () => {};
-
-      ws.onclose = () => {
-        wsRef.current = null;
-        if (isMounted) {
-          reconnectTimer = setTimeout(connect, 3000);
-        }
-      };
-    };
-
-    connect();
-
+    let cancelled = false;
+    api
+      .health()
+      .then((next) => {
+        if (!cancelled) setHealth(next);
+      })
+      .catch(() => {});
     return () => {
-      isMounted = false;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (ws) ws.close();
+      cancelled = true;
     };
   }, []);
 
-  const handleCloseCard = () => {
-    setActiveCard(null);
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: "dismiss_card" }));
-    }
-  };
-
-  /* ── Start microphone & WebRTC ────────────────────── */
-  const startMic = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-
-      // Local visualizer
-      const ctx = new AudioContext();
-      audioCtxRef.current = ctx;
-      const source = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      source.connect(analyser);
-      analyserRef.current = analyser;
-
-      // RTCPeerConnection for FastRTC
-      const pc = new RTCPeerConnection({
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
-      });
-      pcRef.current = pc;
-
-      pc.createDataChannel("data");
-      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-
-      // Handle incoming audio from backend (TTS)
-      pc.ontrack = (event) => {
-        if (!audioElRef.current) {
-          const audio = new Audio();
-          audio.autoplay = true;
-          audioElRef.current = audio;
-        }
-        audioElRef.current.srcObject = event.streams[0];
-      };
-
-      // Create and set local description
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      // Wait for ICE gathering
-      await new Promise<void>((resolve) => {
-        if (pc.iceGatheringState === "complete") {
-          resolve();
-          return;
-        }
-
-        const timeout = setTimeout(() => {
-          resolve();
-        }, 1500);
-
-        pc.onicegatheringstatechange = () => {
-          if (pc.iceGatheringState === "complete") {
-            clearTimeout(timeout);
-            resolve();
-          }
-        };
-      });
-
-      // Send offer to backend
-      const response = await fetch(apiUrl("/rtc/webrtc/offer"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sdp: pc.localDescription?.sdp,
-          type: pc.localDescription?.type,
-          webrtc_id: Math.random().toString(36).substring(7)
-        }),
-      });
-
-      const answer = await response.json();
-      await pc.setRemoteDescription(answer);
-
-      setStatus("listening");
-
-      // Visualizer polling
-      const dataArr = new Uint8Array(analyser.frequencyBinCount);
-      const poll = () => {
-        analyser.getByteFrequencyData(dataArr);
-        let sum = 0;
-        for (let i = 0; i < dataArr.length; i++) sum += dataArr[i];
-        const avg = sum / dataArr.length / 255;
-        setAmplitude(avg);
-        rafRef.current = requestAnimationFrame(poll);
-      };
-      poll();
-    } catch (err) {
-      console.error("WebRTC Error:", err);
-      setStatus("standby");
-    }
-  }, []);
-
-  /* ── Stop microphone & WebRTC ─────────────────────── */
-  const stopMic = useCallback(() => {
-    cancelAnimationFrame(rafRef.current);
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    pcRef.current?.close();
-    audioCtxRef.current?.close();
-
-    if (audioElRef.current) {
-      audioElRef.current.pause();
-      audioElRef.current.srcObject = null;
-    }
-
-    analyserRef.current = null;
-    streamRef.current = null;
-    audioCtxRef.current = null;
-    pcRef.current = null;
-
-    setAmplitude(0);
-    setStatus("standby");
-  }, []);
-
-  useEffect(() => { stopMicRef.current = stopMic; }, [stopMic]);
-  useEffect(() => () => stopMic(), [stopMic]);
-
-  const isActive = status !== "standby";
+  // Both panels stay mounted is *not* what happens here, deliberately: an
+  // unmounted VoiceSession hangs up, and leaving a live microphone open behind a
+  // hidden tab is the kind of thing that gets an app uninstalled.
+  const exhausted = ready && quota && !quota.allowed;
 
   return (
-    <div className="flex flex-col min-h-screen">
-      {/* ── Header ───────────────────────────────────── */}
-      <header className="header">
-        <div className="max-w-6xl mx-auto flex items-center justify-between px-6 py-3">
-          {/* Logo */}
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center shadow-md">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
-                <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-                <line x1="12" x2="12" y1="19" y2="22"/>
-              </svg>
-            </div>
-            <span className="text-xl font-bold tracking-tight" style={{ color: "#1e40af" }}>
-              Bhasha<span className="font-medium" style={{ color: "#6366f1" }}>Agent</span>
-            </span>
-          </div>
+    <div className="mx-auto max-w-6xl px-4 pt-6 pb-16 sm:px-6 sm:pt-10">
+      {/* ── Hero ─────────────────────────────────────────────────────────── */}
+      <section className="mb-8 text-center sm:mb-10">
+        <p className="mb-3 inline-flex items-center gap-2 rounded-full border border-line bg-surface px-3.5 py-1.5 text-[0.875rem] font-semibold text-ink-muted shadow-card">
+          <Sparkles aria-hidden className="size-4 text-accent-strong" />
+          {health?.schemes
+            ? `${health.schemes.toLocaleString("en-IN")} government schemes, searchable by voice`
+            : "Government schemes, searchable by voice"}
+        </p>
+        <h1 className="mx-auto max-w-2xl text-[2.1rem] leading-[1.1] font-extrabold tracking-[-0.035em] text-ink sm:text-5xl">
+          Find the schemes you are{" "}
+          <span className="text-primary">actually entitled to</span>.
+        </h1>
+        <p className="mx-auto mt-4 max-w-xl text-[1.0625rem] leading-relaxed text-ink-muted sm:text-lg">
+          Just say what you need — a scholarship, a pension, a loan for a shop.
+          Speak Hindi, English, Bengali, Marathi, or a mix. No form to fill in and
+          no sign-up to get started.
+        </p>
 
-          {/* Bot badge */}
-          <div
-            className="hidden sm:flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold text-white shadow-lg"
-            style={{
-              background: "linear-gradient(135deg, #3b82f6, #6366f1)",
-              boxShadow: "0 4px 20px rgba(59,130,246,0.35)",
-            }}
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
-              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-            </svg>
-            Voice AI
-          </div>
-        </div>
-      </header>
-
-      {/* ── Main Content ────────────────────────────── */}
-      <main className="flex-1 flex flex-col items-center justify-center pt-24 pb-10 px-4">
-        {/* Title */}
-        <div className="text-center mb-8 mt-4">
-          <h1 className="text-3xl font-bold tracking-tight mb-2" style={{ color: "#1e3a5f" }}>
-            Bhasha-Agent Voice Assistant
-          </h1>
-          <p className="text-lg mt-1.5" style={{ color: "#64748b" }}>
-            Discover government schemes through voice — in your language
-          </p>
-        </div>
-
-        {/* ── Voice Orb ───────────────────────────────── */}
-        <div className="relative mb-6">
-          <VoiceOrb
-            amplitude={amplitude}
-            isActive={isActive}
-            status={status}
-            size={380}
-          />
-        </div>
-
-        {/* Status */}
-        <div className="mt-8 mb-16 flex flex-col items-center">
-          <span className={`status-chip ${status}`}>
-            <span className={`status-dot ${status}`} />
-            {STATUS_LABELS[status]}
+        <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
+          <LanguageSwitcher />
+          <span className="inline-flex items-center gap-1.5 text-[0.9375rem] text-ink-subtle">
+            <ShieldCheck aria-hidden className="size-[1.15rem] text-success" />
+            Nothing personal is stored unless you ask us to
           </span>
-          <p className="subtitle-text mt-5" style={{ color: "#64748b" }}>
-            {STATUS_SUBTITLES[status]}
-          </p>
         </div>
+      </section>
 
-        {/* ── Action Buttons ──────────────────────────── */}
-        <div className="flex items-center gap-6 mt-8">
-          {status === "standby" ? (
-            <button className="btn-primary btn-start" onClick={startMic}>
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
-                <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-                <line x1="12" x2="12" y1="19" y2="22"/>
-              </svg>
-              Start Talking
-            </button>
+      <div
+        className={cn(
+          "grid gap-6",
+          card && "lg:grid-cols-[minmax(0,1fr)_minmax(0,30rem)] lg:items-start",
+        )}
+      >
+        {/* ── The assistant ──────────────────────────────────────────────── */}
+        <div className="space-y-4">
+          {/* Talk or type, as a real choice rather than a fallback. Voice-only
+              excludes anyone in a noisy room, anyone sharing a room, and anyone
+              who would rather not be overheard asking about a poverty scheme. */}
+          <div
+            role="tablist"
+            aria-label="How would you like to ask?"
+            className="flex gap-1 rounded-2xl border border-line bg-surface-2 p-1"
+          >
+            {(
+              [
+                { id: "talk", label: "Talk", icon: Mic },
+                { id: "type", label: "Type", icon: Keyboard },
+              ] as const
+            ).map(({ id, label, icon: Icon }) => (
+              <button
+                key={id}
+                type="button"
+                role="tab"
+                aria-selected={mode === id}
+                onClick={() => setMode(id)}
+                className={cn(
+                  "flex min-h-12 flex-1 items-center justify-center gap-2 rounded-xl font-semibold transition-colors",
+                  mode === id
+                    ? "bg-surface text-ink shadow-card"
+                    : "text-ink-muted hover:text-ink",
+                )}
+              >
+                <Icon aria-hidden className="size-[1.15rem]" />
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {exhausted && (
+            <Card className="border-accent/35 bg-accent-soft p-4 sm:p-5">
+              <p className="text-[1.0625rem] font-bold text-on-accent">
+                You have used today&apos;s free turns.
+              </p>
+              <p className="mt-1 text-[0.9375rem] leading-relaxed text-on-accent/85">
+                Sign in with your phone number for a much larger daily allowance.
+                It takes one text message, and you keep everything you have found
+                so far.
+              </p>
+              <Link
+                href="/login"
+                className="mt-3 inline-flex min-h-12 items-center rounded-xl bg-primary px-5 font-semibold text-on-primary shadow-card transition-colors hover:bg-primary-hover"
+              >
+                Sign in with a phone number
+              </Link>
+            </Card>
+          )}
+
+          {mode === "talk" ? (
+            <VoiceSession language={language} onCard={setCard} />
           ) : (
-            <button className="btn-primary btn-stop" onClick={stopMic}>
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <rect x="6" y="6" width="12" height="12" rx="2"/>
-              </svg>
-              End Session
-            </button>
+            <TextChat language={language} onCard={setCard} />
           )}
         </div>
-      </main>
 
-      {/* ── Scheme Card Pop-up ──────────────────────── */}
-      {activeCard && (
-        <SchemeCard scheme={activeCard} onClose={handleCloseCard} />
+        {/* ── The card ───────────────────────────────────────────────────── */}
+        {card && (
+          <div className="lg:sticky lg:top-20">
+            <SchemeCard
+              scheme={card.scheme}
+              language={card.language ?? language}
+              onDismiss={() => setCard(null)}
+            />
+          </div>
+        )}
+      </div>
+
+      {/* ── What this is ─────────────────────────────────────────────────── */}
+      {!card && (
+        <section className="mt-12 grid gap-4 sm:grid-cols-3">
+          {[
+            {
+              title: "Ask in your own words",
+              body: "No scheme names or category codes. “My daughter is in class 11 in Bihar” is a complete question.",
+            },
+            {
+              title: "Answers you can act on",
+              body: "Eligibility is worked out from the published rules, not guessed — and every card links to the official page.",
+            },
+            {
+              title: "Sign in only if you want to",
+              body: "A phone number raises your daily limit and lets the assistant remember your details. It is never required.",
+            },
+          ].map((item) => (
+            <Card key={item.title} className="p-5">
+              <h2 className="text-[1.0625rem] font-bold text-ink">{item.title}</h2>
+              <p className="mt-1.5 text-[0.9375rem] leading-relaxed text-ink-muted">
+                {item.body}
+              </p>
+            </Card>
+          ))}
+        </section>
       )}
     </div>
   );

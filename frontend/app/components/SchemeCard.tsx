@@ -1,207 +1,396 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
+import {
+  BadgeIndianRupee,
+  CalendarRange,
+  ExternalLink,
+  FileText,
+  ListChecks,
+  Phone,
+  Target,
+  Users,
+  X,
+} from "lucide-react";
+import { Badge, Card } from "./ui/primitives";
+import { IconButton } from "./ui/Button";
+import { CARD_LANGUAGES } from "@/lib/types";
+import type { Language, SchemeCardData, SchemeTranslation } from "@/lib/types";
+import { cn } from "@/lib/cn";
 
 interface SchemeCardProps {
-  scheme: any;
-  onClose: () => void;
+  scheme: SchemeCardData;
+  /** The language the tool was called with — the card opens in it. */
+  language?: Language;
+  onDismiss?: () => void;
+  className?: string;
 }
 
-const LANGUAGES = [
-  { code: "en", label: "English" },
-  { code: "hi", label: "Hindi" },
-  { code: "bn", label: "Bengali" },
-  { code: "mr", label: "Marathi" },
-];
+/** ₹1,20,000 — Indian grouping, because "120,000" is the wrong shape here. */
+const rupees = (value: number) =>
+  new Intl.NumberFormat("en-IN", {
+    style: "currency",
+    currency: "INR",
+    maximumFractionDigits: 0,
+  }).format(value);
 
-export default function SchemeCard({ scheme, onClose }: SchemeCardProps) {
-  const [lang, setLang] = useState("en");
+/** Title-cases the corpus' occasional SHOUTED or lower-case labels without
+ *  touching Devanagari or Bengali, which have no case. */
+const label = (value: string) =>
+  value.length > 3 && value === value.toUpperCase()
+    ? value.charAt(0) + value.slice(1).toLowerCase()
+    : value;
 
-  // Helper to get translated string, falling back to English
-  const t = (key: string) => {
-    if (lang === "en" || !scheme.translations || !scheme.translations[lang]) {
-      return scheme[key] || "";
+export default function SchemeCard({
+  scheme,
+  language = "en",
+  onDismiss,
+  className,
+}: SchemeCardProps) {
+  /**
+   * All four card languages are offered, always.
+   *
+   * v1 built this list by state — English and Hindi for everyone, Bengali only
+   * if `metadata.state === "West Bengal"`, Marathi only for Maharashtra. That
+   * was wrong on the data: the corpus holds native hi/bn/mr for **all** 1,786
+   * schemes. It also had the geography backwards, since the people most likely
+   * to need a Bengali reading of a central scheme are exactly the ones looking
+   * at a scheme that is not filed under West Bengal.
+   */
+  /*
+   * A new card arrives in the language the conversation is in, which may differ
+   * from whatever tab the caller had open on the previous one — so the choice has
+   * to reset. That reset is *derived* from the card's identity rather than
+   * written back by an effect: keying the override on `(scheme, language)` means
+   * a new card simply stops matching and the language falls back on its own, with
+   * no second render and no window in which the wrong script is on screen.
+   */
+  const key = `${scheme.scheme_id}:${language}`;
+  const [picked, setPicked] = useState<{ key: string; language: Language } | null>(null);
+  const shown = picked?.key === key ? picked.language : language;
+  const setShown = (next: Language) => setPicked({ key, language: next });
+
+  const translation: SchemeTranslation | undefined =
+    shown === "en" ? undefined : scheme.translations[shown];
+
+  /** Per-key fallback, not per-card: `_translation_block` omits keys myScheme
+   *  left untranslated, so a card can have a translated name and an English
+   *  description, and showing the English one is better than showing nothing. */
+  const name = translation?.scheme_name || scheme.scheme_name;
+  const description = translation?.description || scheme.description;
+  const eligibilityText =
+    translation?.eligibility_description || scheme.eligibility_description;
+  const documents =
+    translation?.documents_required?.length
+      ? translation.documents_required
+      : scheme.documents_required;
+
+  const criteria = useMemo(() => {
+    const e = scheme.eligibility;
+    const out: { icon: React.ReactNode; text: string }[] = [];
+
+    // NULL means "unspecified — do not exclude", so an absent bound produces no
+    // line at all rather than a "0 and above" that reads as a real rule.
+    if (e.age_min != null || e.age_max != null) {
+      out.push({
+        icon: <CalendarRange aria-hidden className="size-[1.15rem]" />,
+        text:
+          e.age_min != null && e.age_max != null
+            ? `Age ${e.age_min}–${e.age_max} years`
+            : e.age_min != null
+              ? `Age ${e.age_min} and above`
+              : `Age up to ${e.age_max} years`,
+      });
     }
-    return scheme.translations[lang][key] || scheme[key] || "";
-  };
-
-  // Helper to get translated array
-  const tArray = (key: string, subKey?: string) => {
-    const original = scheme[key] || [];
-    if (lang === "en" || !scheme.translations || !scheme.translations[lang]) {
-      return original;
+    if (e.income_max != null) {
+      out.push({
+        icon: <BadgeIndianRupee aria-hidden className="size-[1.15rem]" />,
+        text: `Yearly income up to ${rupees(e.income_max)}`,
+      });
     }
-    const translatedArray = scheme.translations[lang][key];
-    if (!translatedArray || !Array.isArray(translatedArray)) return original;
-    
-    // If it's an array of objects, merge translated fields
-    if (subKey && translatedArray.length > 0 && typeof translatedArray[0] === 'object') {
-       return original.map((item: any, i: number) => ({
-         ...item,
-         [subKey]: translatedArray[i] ? translatedArray[i][subKey] : item[subKey]
-       }));
+    if (e.gender?.length) {
+      out.push({
+        icon: <Users aria-hidden className="size-[1.15rem]" />,
+        text: e.gender.map(label).join(", "),
+      });
     }
-    return translatedArray;
-  };
-
-  const name = t("scheme_name");
-  const description = t("description");
-  const eligibility = t("eligibility_description");
-  const process = t("application_process");
-  const benefits = tArray("benefits", "description");
-  const docs = tArray("documents_required", "name");
-
-  // Determine available languages based on the scheme's state
-  const state = scheme.metadata?.state;
-  const availableLangs = ["en", "hi"];
-  if (state === "West Bengal") availableLangs.push("bn");
-  if (state === "Maharashtra") availableLangs.push("mr");
+    if (e.caste?.length) {
+      out.push({
+        icon: <Users aria-hidden className="size-[1.15rem]" />,
+        text: e.caste.map(label).join(", "),
+      });
+    }
+    if (e.occupation?.length) {
+      out.push({
+        icon: <ListChecks aria-hidden className="size-[1.15rem]" />,
+        text: e.occupation.map(label).join(", "),
+      });
+    }
+    if (e.disability) {
+      out.push({
+        icon: <Users aria-hidden className="size-[1.15rem]" />,
+        text: "For persons with disability",
+      });
+    }
+    if (e.bpl_card) {
+      out.push({
+        icon: <FileText aria-hidden className="size-[1.15rem]" />,
+        text: "BPL ration card required",
+      });
+    }
+    return out;
+  }, [scheme.eligibility]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 md:p-8 bg-slate-900/40 backdrop-blur-md animate-in fade-in duration-200">
-      <div className="bg-white rounded-[24px] shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden ring-1 ring-black/5 animate-in zoom-in-95 duration-300">
-        
-        {/* Header */}
-        <div className="px-8 py-8 border-b border-gray-100 flex flex-col md:flex-row md:items-start justify-between bg-white relative">
-          <div className="flex-1 pr-6">
-            <div className="flex items-center gap-3 mb-4">
-              <span className="px-3 py-1 rounded-full bg-blue-50 text-blue-600 text-sm font-semibold tracking-wide uppercase">
-                {scheme.metadata?.state || "Government Scheme"}
-              </span>
-              <span className="px-3 py-1 rounded-full bg-slate-50 text-slate-600 text-sm font-semibold tracking-wide uppercase border border-slate-100">
-                {scheme.metadata?.category}
-              </span>
+    <Card
+      as="article"
+      aria-labelledby={`scheme-${scheme.scheme_id}-name`}
+      className={cn("animate-rise overflow-hidden", className)}
+    >
+      {/* ── Header ─────────────────────────────────────────────────────── */}
+      <header className="relative border-b border-line bg-primary-soft/60 px-5 py-4 sm:px-6">
+        <div className="flex items-start gap-3">
+          <div className="min-w-0 flex-1 space-y-2.5">
+            <div className="flex flex-wrap items-center gap-1.5">
+              {scheme.metadata.state && (
+                <Badge tone="primary">{scheme.metadata.state}</Badge>
+              )}
+              {scheme.metadata.category && (
+                <Badge tone="neutral">{scheme.metadata.category}</Badge>
+              )}
+              {scheme.metadata.level && (
+                <Badge tone="neutral">{label(scheme.metadata.level)}</Badge>
+              )}
             </div>
-            <h2 className="text-3xl font-extrabold text-slate-900 leading-tight tracking-tight">
+            <h2
+              id={`scheme-${scheme.scheme_id}-name`}
+              className="text-[1.35rem] leading-snug font-extrabold tracking-[-0.02em] text-ink sm:text-2xl"
+            >
               {name}
             </h2>
             {scheme.ministry && (
-              <p className="text-base text-slate-500 mt-2 font-medium">{scheme.ministry}</p>
-            )}
-          </div>
-          
-          <div className="flex items-center gap-4 mt-6 md:mt-0">
-            {/* Language Selector */}
-            <select
-              value={lang}
-              onChange={(e) => setLang(e.target.value)}
-              className="text-base border-gray-200 rounded-xl bg-slate-50 shadow-sm focus:ring-blue-500 focus:border-blue-500 py-2.5 pl-4 pr-10 font-medium cursor-pointer transition-colors hover:bg-slate-100"
-            >
-              {LANGUAGES.filter(l => availableLangs.includes(l.code)).map(l => (
-                <option key={l.code} value={l.code}>{l.label}</option>
-              ))}
-            </select>
-            
-            <button 
-              onClick={onClose}
-              className="p-3 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-full transition-colors"
-            >
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M18 6 6 18"/><path d="m6 6 12 12"/>
-              </svg>
-            </button>
-          </div>
-        </div>
-
-        {/* Content Body */}
-        <div className="flex-1 overflow-y-auto px-8 py-8 space-y-10 custom-scrollbar">
-          
-          {/* Top section: Description & Eligibility side-by-side if on desktop */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-10">
-            <div>
-              <h3 className="text-xl font-bold text-slate-900 mb-3">Overview</h3>
-              <p className="text-slate-600 text-base leading-relaxed whitespace-pre-wrap">{description}</p>
-            </div>
-            
-            {eligibility && (
-              <div>
-                <h3 className="text-xl font-bold text-slate-900 mb-3">Eligibility</h3>
-                <p className="text-slate-600 text-base leading-relaxed whitespace-pre-wrap">{eligibility}</p>
-              </div>
+              <p className="text-[0.9375rem] text-ink-muted">{scheme.ministry}</p>
             )}
           </div>
 
-          {/* Benefits */}
-          {benefits && benefits.length > 0 && (
-            <div>
-              <h3 className="text-xl font-bold text-slate-900 mb-4">Key Benefits</h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {benefits.map((b: any, i: number) => (
-                  <div key={i} className="flex items-start gap-4 p-5 rounded-2xl bg-blue-50/40 border border-blue-100/50">
-                    <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center flex-shrink-0 mt-0.5">
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-blue-600">
-                        <polyline points="20 6 9 17 4 12"/>
-                      </svg>
-                    </div>
-                    <div>
-                      {b.amount && <div className="text-lg font-bold text-blue-700 mb-1">₹{b.amount}</div>}
-                      <p className="text-base text-slate-700 leading-relaxed">{b.description}</p>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
+          {onDismiss && (
+            <IconButton
+              label="Close this scheme"
+              variant="ghost"
+              size="sm"
+              onClick={onDismiss}
+              className="-mt-1 shrink-0"
+            >
+              <X aria-hidden className="size-5" />
+            </IconButton>
           )}
-
-          {/* Documents & Process */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-10 pt-6 border-t border-slate-100">
-            {docs && docs.length > 0 && (
-              <div>
-                <h3 className="text-xl font-bold text-slate-900 mb-4">Documents Required</h3>
-                <ul className="space-y-4">
-                  {docs.map((d: any, i: number) => (
-                    <li key={i} className="text-base text-slate-600 flex items-start gap-3">
-                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-slate-300 flex-shrink-0 mt-0.5">
-                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>
-                      </svg>
-                      <span>
-                        {d.name} {d.is_mandatory && <span className="text-rose-500 font-medium ml-1 text-sm bg-rose-50 px-2 py-0.5 rounded">*Required</span>}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-
-            {process && (
-              <div>
-                <h3 className="text-xl font-bold text-slate-900 mb-4">Application Process</h3>
-                <div className="text-base text-slate-600 whitespace-pre-wrap leading-relaxed">
-                  {process}
-                </div>
-              </div>
-            )}
-          </div>
         </div>
 
-        {/* Footer */}
-        <div className="px-8 py-5 bg-white border-t border-gray-100 flex flex-col md:flex-row justify-between items-center gap-4">
-          <p className="text-sm text-slate-500 font-medium">
-            Source: <a href={scheme.source_url} target="_blank" rel="noreferrer" className="text-blue-600 hover:text-blue-700 hover:underline">Official Govt. Portal</a>
-          </p>
-          <div className="flex gap-4 w-full md:w-auto">
-            <button 
-              onClick={onClose}
-              className="flex-1 md:flex-none px-6 py-3.5 text-base font-bold text-slate-600 bg-white border-2 border-slate-200 rounded-xl hover:bg-slate-50 hover:text-slate-900 transition-colors"
-            >
-              Dismiss
-            </button>
-            {scheme.application_url && (
-              <a 
-                href={scheme.application_url}
-                target="_blank"
-                rel="noreferrer"
-                className="flex-1 md:flex-none px-8 py-3.5 text-base font-bold text-white bg-blue-600 rounded-xl hover:bg-blue-700 transition-all flex items-center justify-center gap-2 shadow-lg shadow-blue-200/50"
+        {/* Language tabs. Each is written in its own script: someone who needs
+            the Bengali reading may not be able to read the word "Bengali". */}
+        <div role="tablist" aria-label="Card language" className="mt-4 flex flex-wrap gap-1.5">
+          {CARD_LANGUAGES.map((option) => {
+            const active = shown === option.code;
+            return (
+              <button
+                key={option.code}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                onClick={() => setShown(option.code)}
+                className={cn(
+                  "min-h-11 rounded-xl px-3.5 text-[0.9375rem] font-semibold transition-colors",
+                  active
+                    ? "bg-primary text-on-primary shadow-card"
+                    : "bg-surface/70 text-ink-muted hover:bg-surface hover:text-ink",
+                )}
               >
-                Apply Online
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
-                </svg>
-              </a>
-            )}
-          </div>
+                {option.native}
+              </button>
+            );
+          })}
         </div>
+      </header>
+
+      {/* ── Body ───────────────────────────────────────────────────────── */}
+      <div className="scroll-slim max-h-[min(60vh,32rem)] space-y-6 overflow-y-auto px-5 py-5 sm:px-6">
+        {description && (
+          <p className="text-[1.0625rem] leading-relaxed text-ink">{description}</p>
+        )}
+
+        {scheme.benefits.length > 0 && (
+          <Section
+            icon={<BadgeIndianRupee aria-hidden className="size-[1.15rem]" />}
+            title="What you get"
+            tone="accent"
+          >
+            <ul className="space-y-2.5">
+              {scheme.benefits.map((benefit, i) => (
+                <li
+                  key={i}
+                  className="rounded-xl border border-accent/25 bg-accent-soft px-4 py-3"
+                >
+                  {benefit.amount != null && benefit.amount !== "" && (
+                    <p className="text-lg font-extrabold text-on-accent">
+                      {typeof benefit.amount === "number"
+                        ? rupees(benefit.amount)
+                        : benefit.amount}
+                    </p>
+                  )}
+                  <p className="text-[0.9375rem] leading-relaxed text-ink">
+                    {benefit.description}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </Section>
+        )}
+
+        {(criteria.length > 0 || eligibilityText) && (
+          <Section
+            icon={<ListChecks aria-hidden className="size-[1.15rem]" />}
+            title="Who can apply"
+          >
+            {criteria.length > 0 && (
+              <ul className="mb-3 grid gap-2 sm:grid-cols-2">
+                {criteria.map((item, i) => (
+                  <li
+                    key={i}
+                    className="flex items-start gap-2.5 rounded-xl bg-surface-2 px-3.5 py-2.5"
+                  >
+                    <span className="mt-0.5 shrink-0 text-primary">{item.icon}</span>
+                    <span className="text-[0.9375rem] leading-snug text-ink">
+                      {item.text}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {eligibilityText && (
+              <p className="text-[0.9375rem] leading-relaxed whitespace-pre-wrap text-ink-muted">
+                {eligibilityText}
+              </p>
+            )}
+          </Section>
+        )}
+
+        {scheme.objectives.length > 0 && (
+          <Section
+            icon={<Target aria-hidden className="size-[1.15rem]" />}
+            title="Purpose"
+          >
+            <ul className="space-y-1.5">
+              {scheme.objectives.map((objective, i) => (
+                <li
+                  key={i}
+                  className="flex gap-2.5 text-[0.9375rem] leading-relaxed text-ink-muted"
+                >
+                  <span aria-hidden className="mt-2 size-1.5 shrink-0 rounded-full bg-primary/50" />
+                  {objective}
+                </li>
+              ))}
+            </ul>
+          </Section>
+        )}
+
+        {documents.length > 0 && (
+          <Section
+            icon={<FileText aria-hidden className="size-[1.15rem]" />}
+            title="Papers to carry"
+          >
+            <ul className="flex flex-wrap gap-1.5">
+              {documents.map((doc, i) => (
+                <li key={i}>
+                  <Badge tone={doc.is_mandatory === false ? "neutral" : "primary"}>
+                    {doc.name}
+                    {doc.is_mandatory === false && (
+                      <span className="font-normal text-ink-subtle">optional</span>
+                    )}
+                  </Badge>
+                </li>
+              ))}
+            </ul>
+          </Section>
+        )}
+
+        {scheme.application_process && (
+          <Section
+            icon={<ListChecks aria-hidden className="size-[1.15rem]" />}
+            title="How to apply"
+          >
+            {/* Pre-wrapped: `_process_text` flattens the structured
+                `[{mode, url, steps[]}]` into text with its own line breaks. */}
+            <p className="text-[0.9375rem] leading-relaxed whitespace-pre-wrap text-ink-muted">
+              {scheme.application_process}
+            </p>
+          </Section>
+        )}
       </div>
-    </div>
+
+      {/* ── Actions ────────────────────────────────────────────────────── */}
+      <footer className="flex flex-wrap items-center gap-2 border-t border-line bg-surface-2/60 px-5 py-4 sm:px-6">
+        {scheme.application_url && (
+          <a
+            href={scheme.application_url}
+            target="_blank"
+            rel="noreferrer"
+            className={cn(
+              "inline-flex min-h-12 items-center gap-2 rounded-xl bg-primary px-5",
+              "font-semibold text-on-primary shadow-card transition-colors hover:bg-primary-hover",
+            )}
+          >
+            Apply on the official site
+            <ExternalLink aria-hidden className="size-[1.05rem]" />
+          </a>
+        )}
+        {scheme.source_url && (
+          <a
+            href={scheme.source_url}
+            target="_blank"
+            rel="noreferrer"
+            className={cn(
+              "inline-flex min-h-12 items-center gap-2 rounded-xl border border-line-strong",
+              "bg-surface px-4 font-semibold text-ink transition-colors hover:bg-surface-2",
+            )}
+          >
+            Full details
+            <ExternalLink aria-hidden className="size-[1.05rem]" />
+          </a>
+        )}
+        {scheme.helpline && (
+          <a
+            href={`tel:${scheme.helpline.replace(/[^\d+]/g, "")}`}
+            className="inline-flex min-h-12 items-center gap-2 rounded-xl px-3 font-semibold text-primary hover:underline"
+          >
+            <Phone aria-hidden className="size-[1.05rem]" />
+            {scheme.helpline}
+          </a>
+        )}
+      </footer>
+    </Card>
+  );
+}
+
+function Section({
+  icon,
+  title,
+  tone = "primary",
+  children,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  tone?: "primary" | "accent";
+  children: React.ReactNode;
+}) {
+  return (
+    <section>
+      <h3 className="mb-2.5 flex items-center gap-2 text-[0.8125rem] font-bold tracking-[0.06em] text-ink-subtle uppercase">
+        <span className={tone === "accent" ? "text-accent-strong" : "text-primary"}>
+          {icon}
+        </span>
+        {title}
+      </h3>
+      {children}
+    </section>
   );
 }

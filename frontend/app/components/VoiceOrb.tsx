@@ -1,187 +1,274 @@
 "use client";
 
-import { useRef, useEffect, useCallback } from "react";
+import { useEffect, useRef } from "react";
+import type { RefObject } from "react";
+import { cn } from "@/lib/cn";
 
+export type OrbState =
+  | "idle"
+  | "connecting"
+  | "listening"
+  | "thinking"
+  | "speaking";
+
+/**
+ * The orb.
+ *
+ * Three things about this are deliberate, and each one is a fix for how v1 did
+ * it.
+ *
+ * **The animation loop starts once and never restarts.** It reads the current
+ * loudness out of `level.current` and the current mode out of `mode.current`, so
+ * neither a new audio sample nor a state change touches the effect. v1's loop
+ * was torn down and rebuilt on every amplitude update — roughly sixty times a
+ * second while the mic was live — which also resized the canvas sixty times a
+ * second.
+ *
+ * **Two loudness sources, not one.** v1 read the local microphone only, so the
+ * orb sat perfectly still for the entire time the agent was talking, which is
+ * most of a call. Whoever holds the floor drives it: the caller's mic while
+ * listening, the bot's track while speaking.
+ *
+ * **Shapes, not particles.** v1 called `arc()` 260 times per frame to draw 260
+ * one-pixel dots. This draws three smooth closed paths of 72 points each and one
+ * gradient, which is fewer canvas operations for a result that reads as a living
+ * thing rather than static.
+ *
+ * Sizing comes from a ResizeObserver rather than a `size` prop, so the component
+ * is responsive without the parent computing pixels — and so a resize does not
+ * have to invalidate anything.
+ */
 interface VoiceOrbProps {
-  amplitude: number;       // 0‑1 normalised loudness
-  isActive: boolean;       // true when mic / voice is streaming
-  status: "standby" | "listening" | "processing" | "speaking";
-  size?: number;           // canvas CSS px (default 380)
+  /** Loudness, 0-1, updated out-of-band. See `useAudioLevel`. */
+  level: RefObject<number>;
+  state: OrbState;
+  className?: string;
 }
 
-// ── Tunables ───────────────────────────────────────────
-const PARTICLE_COUNT   = 260;
-const CORE_RADIUS      = 0.28;   // fraction of half‑size
-const RING_MIN         = 0.32;
-const RING_MAX         = 0.75;
-const BREATH_SPEED     = 0.004;
-const ROTATION_SPEED   = 0.0003;
-const AMPLITUDE_SMOOTH = 0.12;   // how fast amp responds
-const MAX_DISPLACEMENT = 50;     // px extra radius on max amp
+/** Which token drives the colour in each mode. Listening is the warm one: it is
+ *  the only moment the caller is being asked to act, and the accent is the only
+ *  warm colour in the palette precisely so it can mean that. */
+const MODE_TOKEN: Record<OrbState, "--primary" | "--accent" | "--ink-subtle"> = {
+  idle: "--ink-subtle",
+  connecting: "--primary",
+  listening: "--accent",
+  thinking: "--primary",
+  speaking: "--primary",
+};
 
-// Colour palette (blue / indigo theme)
-const PALETTE = [
-  [59, 130, 246],   // blue-500
-  [99, 102, 241],   // indigo-500
-  [147, 197, 253],  // blue-300
-  [129, 140, 248],  // indigo-400
-  [96, 165, 250],   // blue-400
-  [199, 210, 254],  // indigo-200
-  [56, 189, 248],   // sky-400
-];
+/** How much of the orb's radius the loudness reading is allowed to move. */
+const MODE_REACTIVITY: Record<OrbState, number> = {
+  idle: 0,
+  connecting: 0.02,
+  listening: 0.16,
+  thinking: 0.05,
+  speaking: 0.2,
+};
 
-interface Particle {
-  angle: number;
-  radius: number;   // fraction (RING_MIN … RING_MAX)
-  speed: number;
-  size: number;
-  color: number[];
-  opacity: number;
-  phaseOffset: number;
-}
+export default function VoiceOrb({ level, state, className }: VoiceOrbProps) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  // The loop reads these instead of closing over props, which is what lets the
+  // effect below have an empty dependency list.
+  const mode = useRef<OrbState>(state);
+  const colour = useRef<[number, number, number]>([120, 120, 140]);
+  // A ref *to* the level ref. The caller swaps which track drives the orb —
+  // their own mic while listening, the bot's while it speaks — and the loop
+  // closed over its arguments at mount, so it has to be able to see the swap.
+  const source = useRef(level);
 
-function makeParticles(): Particle[] {
-  const out: Particle[] = [];
-  for (let i = 0; i < PARTICLE_COUNT; i++) {
-    out.push({
-      angle:       Math.random() * Math.PI * 2,
-      radius:      RING_MIN + Math.random() * (RING_MAX - RING_MIN),
-      speed:       0.0004 + Math.random() * 0.0012,
-      size:        1.2 + Math.random() * 2.8,
-      color:       PALETTE[Math.floor(Math.random() * PALETTE.length)],
-      opacity:     0.25 + Math.random() * 0.55,
-      phaseOffset: Math.random() * Math.PI * 2,
+  // Assigned in an effect rather than during render. A ref write during render
+  // is not permitted — under concurrent rendering the render that wrote it need
+  // not be the one that commits — and the loop reads these asynchronously, so
+  // landing them a frame after the paint is not observable.
+  useEffect(() => {
+    mode.current = state;
+    source.current = level;
+  });
+
+  /* Resolve the CSS token to concrete RGB whenever the mode or the theme
+     changes. Doing this per frame would mean a `getComputedStyle` — a forced
+     style recalculation — sixty times a second. */
+  useEffect(() => {
+    const read = () => {
+      const probe = document.createElement("span");
+      probe.style.color = `var(${MODE_TOKEN[state]})`;
+      probe.style.position = "absolute";
+      probe.style.opacity = "0";
+      document.body.appendChild(probe);
+      const computed = getComputedStyle(probe).color;
+      probe.remove();
+      const parsed = computed.match(/[\d.]+/g);
+      if (parsed && parsed.length >= 3) {
+        colour.current = [
+          Number(parsed[0]),
+          Number(parsed[1]),
+          Number(parsed[2]),
+        ];
+      }
+    };
+    read();
+
+    // The theme toggle mutates the class on <html>; the token then resolves to a
+    // different colour and the orb has to be told.
+    const observer = new MutationObserver(read);
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["class"],
     });
-  }
-  return out;
-}
+    return () => observer.disconnect();
+  }, [state]);
 
-export default function VoiceOrb({
-  amplitude,
-  isActive,
-  status,
-  size = 380,
-}: VoiceOrbProps) {
-  const canvasRef   = useRef<HTMLCanvasElement>(null);
-  const particles   = useRef<Particle[]>(makeParticles());
-  const frameId     = useRef<number>(0);
-  const smoothAmp   = useRef(0);
-  const time        = useRef(0);
-
-  /* ---- animation loop ---- */
-  const draw = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d")!;
-    const dpr = window.devicePixelRatio || 1;
-    const w = canvas.width  / dpr;
-    const h = canvas.height / dpr;
-    const cx = w / 2;
-    const cy = h / 2;
-    const half = Math.min(cx, cy);
-
-    time.current += 1;
-
-    // smooth amplitude
-    const target = isActive ? amplitude : 0;
-    smoothAmp.current += (target - smoothAmp.current) * AMPLITUDE_SMOOTH;
-    const amp = smoothAmp.current;
-
-    ctx.clearRect(0, 0, w, h);
-
-    // ── 1. Core glow ──────────────────────────────────
-    const coreR = half * CORE_RADIUS * (1 + amp * 0.2);
-    const breathScale = 1 + Math.sin(time.current * BREATH_SPEED) * 0.04;
-    const finalCoreR = coreR * breathScale;
-
-    // outer glow
-    const glowGrad = ctx.createRadialGradient(cx, cy, finalCoreR * 0.5, cx, cy, finalCoreR * 2.2);
-    glowGrad.addColorStop(0, `rgba(59, 130, 246, ${0.06 + amp * 0.08})`);
-    glowGrad.addColorStop(0.5, `rgba(99, 102, 241, ${0.03 + amp * 0.04})`);
-    glowGrad.addColorStop(1, "rgba(99, 102, 241, 0)");
-    ctx.beginPath();
-    ctx.arc(cx, cy, finalCoreR * 2.2, 0, Math.PI * 2);
-    ctx.fillStyle = glowGrad;
-    ctx.fill();
-
-    // core fill
-    const coreGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, finalCoreR);
-    coreGrad.addColorStop(0, `rgba(219, 234, 254, ${0.7 + amp * 0.2})`);
-    coreGrad.addColorStop(0.6, `rgba(191, 219, 254, ${0.45 + amp * 0.15})`);
-    coreGrad.addColorStop(1, `rgba(147, 197, 253, ${0.15 + amp * 0.1})`);
-    ctx.beginPath();
-    ctx.arc(cx, cy, finalCoreR, 0, Math.PI * 2);
-    ctx.fillStyle = coreGrad;
-    ctx.fill();
-
-    // subtle core ring
-    ctx.beginPath();
-    ctx.arc(cx, cy, finalCoreR, 0, Math.PI * 2);
-    ctx.strokeStyle = `rgba(147, 197, 253, ${0.2 + amp * 0.15})`;
-    ctx.lineWidth = 1;
-    ctx.stroke();
-
-    // ── 2. Particles ──────────────────────────────────
-    const t = time.current;
-    for (const p of particles.current) {
-      // move
-      p.angle += p.speed + amp * p.speed * 3;
-
-      // radial displacement based on amplitude
-      const wave = Math.sin(t * BREATH_SPEED * 2 + p.phaseOffset);
-      const ampDisplace = amp * MAX_DISPLACEMENT * (0.5 + 0.5 * wave);
-      const baseR = half * p.radius * breathScale;
-      const r = baseR + ampDisplace;
-
-      // global rotation
-      const globalAngle = t * ROTATION_SPEED;
-      const angle = p.angle + globalAngle;
-
-      const x = cx + Math.cos(angle) * r;
-      const y = cy + Math.sin(angle) * r;
-
-      // pulse opacity
-      const opMod = 0.7 + 0.3 * Math.sin(t * 0.008 + p.phaseOffset);
-      const finalOp = p.opacity * opMod * (0.5 + amp * 0.5 + (isActive ? 0.2 : 0));
-
-      ctx.beginPath();
-      ctx.arc(x, y, p.size * (1 + amp * 0.6), 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(${p.color[0]}, ${p.color[1]}, ${p.color[2]}, ${finalOp})`;
-      ctx.fill();
-    }
-
-    // ── 3. Faint concentric rings ─────────────────────
-    for (let i = 1; i <= 3; i++) {
-      const ringR = half * (CORE_RADIUS + 0.12 * i) * breathScale + amp * 10 * i;
-      ctx.beginPath();
-      ctx.arc(cx, cy, ringR, 0, Math.PI * 2);
-      ctx.strokeStyle = `rgba(147, 197, 253, ${0.06 - i * 0.012 + amp * 0.04})`;
-      ctx.lineWidth = 0.8;
-      ctx.stroke();
-    }
-
-    frameId.current = requestAnimationFrame(draw);
-  }, [amplitude, isActive]);
-
-  /* ---- lifecycle ---- */
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width  = size * dpr;
-    canvas.height = size * dpr;
-    const ctx = canvas.getContext("2d")!;
-    ctx.scale(dpr, dpr);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
 
-    frameId.current = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(frameId.current);
-  }, [draw, size]);
+    const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    let width = 0;
+    let height = 0;
+    // Capped at 2. A 3x-DPR phone would otherwise paint nine times the pixels
+    // for a blurry blob nobody can see the difference in, on the slowest GPU we
+    // are targeting.
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+    const resize = () => {
+      const rect = canvas.getBoundingClientRect();
+      width = rect.width;
+      height = rect.height;
+      canvas.width = Math.round(width * dpr);
+      canvas.height = Math.round(height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    };
+    resize();
+
+    const observer = new ResizeObserver(resize);
+    observer.observe(canvas);
+
+    // Smoothed separately from the analyser: the analyser's own smoothing stops
+    // the number jittering, this stops the *shape* snapping when a turn starts.
+    let smoothed = 0;
+    let raf = 0;
+    const started = performance.now();
+
+    /** One closed, wobbling ring. `harmonic` and `phase` differ per ring so the
+     *  three never line up and the whole thing reads as organic. */
+    const ring = (
+      cx: number,
+      cy: number,
+      radius: number,
+      wobble: number,
+      harmonic: number,
+      phase: number,
+      alpha: number,
+    ) => {
+      const [r, g, b] = colour.current;
+      const POINTS = 72;
+      ctx.beginPath();
+      for (let i = 0; i <= POINTS; i++) {
+        const theta = (i / POINTS) * Math.PI * 2;
+        const offset =
+          Math.sin(theta * harmonic + phase) * wobble +
+          Math.sin(theta * (harmonic + 2) - phase * 1.4) * wobble * 0.45;
+        const rr = radius + offset;
+        const x = cx + Math.cos(theta) * rr;
+        const y = cy + Math.sin(theta) * rr;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+
+      const gradient = ctx.createLinearGradient(
+        cx - radius,
+        cy - radius,
+        cx + radius,
+        cy + radius,
+      );
+      gradient.addColorStop(0, `rgba(${r},${g},${b},${alpha})`);
+      gradient.addColorStop(1, `rgba(${r},${g},${b},${alpha * 0.35})`);
+      ctx.fillStyle = gradient;
+      ctx.fill();
+    };
+
+    const frame = (now: number) => {
+      const t = (now - started) / 1000;
+      const current = mode.current;
+      const [r, g, b] = colour.current;
+
+      const target = current === "idle" ? 0 : source.current.current;
+      // Asymmetric easing: rise fast so the orb answers a voice immediately,
+      // fall slowly so it does not flicker between syllables.
+      smoothed += (target - smoothed) * (target > smoothed ? 0.35 : 0.08);
+
+      ctx.clearRect(0, 0, width, height);
+
+      const cx = width / 2;
+      const cy = height / 2;
+      const base = Math.min(width, height) * 0.29;
+      const reactivity = MODE_REACTIVITY[current];
+      const breath =
+        still || current === "idle"
+          ? 0
+          : Math.sin(t * (current === "thinking" ? 3.4 : 1.5)) * 0.022;
+      const radius = base * (1 + breath + smoothed * reactivity);
+
+      // Outer glow. Grows with loudness so a loud room feels louder without the
+      // silhouette itself jumping around.
+      const glow = ctx.createRadialGradient(cx, cy, radius * 0.55, cx, cy, radius * 2.1);
+      glow.addColorStop(0, `rgba(${r},${g},${b},${0.2 + smoothed * 0.26})`);
+      glow.addColorStop(1, `rgba(${r},${g},${b},0)`);
+      ctx.fillStyle = glow;
+      ctx.fillRect(0, 0, width, height);
+
+      const spin = still ? 0 : t;
+      const wobble = radius * (0.035 + smoothed * 0.1);
+      ring(cx, cy, radius * 1.16, wobble * 1.5, 3, spin * 0.55, 0.16);
+      ring(cx, cy, radius * 1.06, wobble * 1.2, 4, -spin * 0.8 + 1.2, 0.22);
+      ring(cx, cy, radius, wobble, 5, spin * 1.15 + 2.6, 0.34);
+
+      // The core. Solid enough to be the focal point at any size, with a
+      // top-left highlight so it reads as a sphere and not a disc.
+      const core = ctx.createRadialGradient(
+        cx - radius * 0.3,
+        cy - radius * 0.34,
+        radius * 0.05,
+        cx,
+        cy,
+        radius * 0.94,
+      );
+      core.addColorStop(0, `rgba(255,255,255,0.5)`);
+      core.addColorStop(0.32, `rgba(${r},${g},${b},0.96)`);
+      core.addColorStop(1, `rgba(${r},${g},${b},0.72)`);
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius * 0.84, 0, Math.PI * 2);
+      ctx.fillStyle = core;
+      ctx.fill();
+
+      if (!still) raf = requestAnimationFrame(frame);
+    };
+
+    // One frame is enough when motion is off — the orb still shows the mode
+    // colour and the loudness at the moment it painted.
+    raf = requestAnimationFrame(frame);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      observer.disconnect();
+    };
+    // Empty on purpose. Everything that varies is read through a ref, which is
+    // the fix for v1's restart-per-frame bug; adding `state` here would
+    // reintroduce it.
+  }, []);
 
   return (
     <canvas
       ref={canvasRef}
-      className="voice-canvas"
-      style={{ width: size, height: size }}
+      // The orb is decoration; the state it represents is announced in text
+      // beside it, so a screen reader that also read this out would say
+      // everything twice.
+      aria-hidden
+      className={cn("size-full", className)}
     />
   );
 }
