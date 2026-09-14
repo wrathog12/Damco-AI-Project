@@ -1,207 +1,352 @@
 @import "tailwindcss";
 
+/* ─────────────────────────────────────────────────────────────────────────
+   Dark mode is class-driven, not media-driven.
+
+   Tailwind v4's stock `dark:` variant reads `prefers-color-scheme`, which gives
+   the caller no way to override it. This audience often uses a phone whose
+   system theme was set once by a shop and never touched, so the switch has to
+   be ours. `providers.tsx` puts `.dark` on <html>; the `:where()` keeps the
+   variant at zero specificity so utility order still decides who wins.
+   ───────────────────────────────────────────────────────────────────────── */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Tokens.
+
+   Every colour the app uses is declared once here and referenced through
+   Tailwind utilities (`bg-surface`, `text-ink-muted`, `border-line`). There
+   are deliberately no raw hex values anywhere in a component: the v1 frontend
+   had three styling systems at once — utilities, hand-written classes, and
+   inline `style={{ color: "#1e40af" }}` — and the inline layer is what made
+   dark mode impossible to add.
+
+   Written in oklch because the ramps are perceptually even: `--ink-muted` and
+   `--ink-subtle` are the *same* hue and chroma as `--ink` at lower lightness,
+   so muted text never drifts blue-grey the way an eyeballed hex ramp does.
+   ───────────────────────────────────────────────────────────────────────── */
 :root {
-  --background: #f8faff;
-  --foreground: #1a2b4a;
-  --primary: #3b82f6;
-  --primary-light: #93c5fd;
-  --primary-dark: #1d4ed8;
-  --accent: #6366f1;
-  --surface: #ffffff;
-  --muted: #94a3b8;
+  color-scheme: light;
+
+  /* Page and surfaces. Faintly warm rather than pure white — a benefits app
+     read for twenty minutes on a cheap LCD is more comfortable off-white. */
+  --canvas: oklch(0.982 0.006 85);
+  --surface: oklch(1 0 0);
+  --surface-2: oklch(0.968 0.006 85);
+  --surface-3: oklch(0.94 0.008 85);
+
+  /* Text. */
+  --ink: oklch(0.24 0.028 265);
+  --ink-muted: oklch(0.48 0.022 265);
+  --ink-subtle: oklch(0.62 0.018 265);
+  --ink-inverse: oklch(0.98 0.004 265);
+
+  --line: oklch(0.9 0.01 265);
+  --line-strong: oklch(0.84 0.014 265);
+
+  /* Primary — deep indigo. Institutional without being the default SaaS blue. */
+  --primary: oklch(0.5 0.16 264);
+  --primary-hover: oklch(0.44 0.16 264);
+  --primary-soft: oklch(0.95 0.028 264);
+  --primary-ring: oklch(0.66 0.14 264);
+  --on-primary: oklch(0.99 0 0);
+
+  /* Accent — marigold. The only warm colour in the system, so it is reserved
+     for the live voice state and for "you qualify". Spending it on decoration
+     would cost the app its one attention-getting signal. */
+  --accent: oklch(0.76 0.155 65);
+  --accent-strong: oklch(0.66 0.16 55);
+  --accent-soft: oklch(0.965 0.04 80);
+  --on-accent: oklch(0.24 0.05 60);
+
+  --success: oklch(0.58 0.13 155);
+  --success-soft: oklch(0.95 0.04 155);
+  --warning: oklch(0.72 0.15 75);
+  --warning-soft: oklch(0.96 0.05 85);
+  --danger: oklch(0.55 0.19 22);
+  --danger-soft: oklch(0.955 0.03 22);
+
+  /* Elevation. Two shadows, both tinted with the ink hue instead of black —
+     a neutral-black shadow over a warm canvas reads as dirt. */
+  --shadow-card: 0 1px 2px oklch(0.24 0.028 265 / 0.05),
+    0 8px 24px -12px oklch(0.24 0.028 265 / 0.14);
+  --shadow-float: 0 2px 4px oklch(0.24 0.028 265 / 0.06),
+    0 24px 56px -20px oklch(0.24 0.028 265 / 0.28);
 }
 
+.dark {
+  color-scheme: dark;
+
+  --canvas: oklch(0.18 0.022 265);
+  --surface: oklch(0.225 0.024 265);
+  --surface-2: oklch(0.262 0.026 265);
+  --surface-3: oklch(0.31 0.028 265);
+
+  --ink: oklch(0.965 0.008 265);
+  --ink-muted: oklch(0.76 0.018 265);
+  --ink-subtle: oklch(0.62 0.02 265);
+  --ink-inverse: oklch(0.2 0.02 265);
+
+  --line: oklch(0.34 0.026 265);
+  --line-strong: oklch(0.44 0.03 265);
+
+  /* Lifted, because a 0.5-lightness indigo on a 0.18 canvas fails contrast for
+     body-sized text. The hover direction flips too: on dark, hover brightens. */
+  --primary: oklch(0.72 0.13 264);
+  --primary-hover: oklch(0.79 0.12 264);
+  --primary-soft: oklch(0.3 0.05 264);
+  --primary-ring: oklch(0.72 0.13 264);
+  --on-primary: oklch(0.18 0.03 264);
+
+  --accent: oklch(0.8 0.14 70);
+  --accent-strong: oklch(0.86 0.13 75);
+  --accent-soft: oklch(0.32 0.05 65);
+  --on-accent: oklch(0.2 0.04 60);
+
+  --success: oklch(0.74 0.14 155);
+  --success-soft: oklch(0.29 0.05 155);
+  --warning: oklch(0.82 0.14 80);
+  --warning-soft: oklch(0.31 0.05 80);
+  --danger: oklch(0.7 0.16 22);
+  --danger-soft: oklch(0.3 0.06 22);
+
+  --shadow-card: 0 1px 2px oklch(0 0 0 / 0.3), 0 8px 24px -12px oklch(0 0 0 / 0.5);
+  --shadow-float: 0 2px 4px oklch(0 0 0 / 0.35), 0 24px 56px -20px oklch(0 0 0 / 0.7);
+}
+
+/* Expose the tokens to Tailwind. `inline` so the generated utilities reference
+   `var(--canvas)` directly rather than snapshotting its value — that is what
+   makes one `.dark` class re-theme the whole tree with no duplicated CSS. */
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: 'Inter', var(--font-geist-sans), sans-serif;
-  --font-mono: var(--font-geist-mono);
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+
+  --color-ink: var(--ink);
+  --color-ink-muted: var(--ink-muted);
+  --color-ink-subtle: var(--ink-subtle);
+  --color-ink-inverse: var(--ink-inverse);
+
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+
+  --color-primary: var(--primary);
+  --color-primary-hover: var(--primary-hover);
+  --color-primary-soft: var(--primary-soft);
+  --color-on-primary: var(--on-primary);
+
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-accent-soft: var(--accent-soft);
+  --color-on-accent: var(--on-accent);
+
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+
+  --shadow-card: var(--shadow-card);
+  --shadow-float: var(--shadow-float);
+
+  /* Fonts come from `next/font` in layout.tsx. The Indic families sit in the
+     stack after Inter so a Devanagari or Bengali glyph — which the corpus is
+     full of — resolves to a real face instead of the OS fallback. They are
+     loaded with `preload: false`, so an English-only session never pays for
+     them. `--font-geist-*` used to be referenced here and was never defined
+     anywhere; that is gone. */
+  --font-sans: var(--font-inter), var(--font-devanagari), var(--font-bengali),
+    ui-sans-serif, system-ui, sans-serif;
+
+  --radius-card: 1rem;
+
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
+@layer base {
+  * {
+    border-color: var(--line);
+  }
+
+  html {
+    /* Anchors on long scheme pages are behind a sticky header. */
+    scroll-behavior: smooth;
+    scroll-padding-top: 5rem;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    background-color: var(--canvas);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    /* 17px, not 16. Every usability note about this audience says the same
+       thing: the default browser size is too small to read comfortably on a
+       cheap 5" screen held at arm's length. */
+    font-size: 1.0625rem;
+    line-height: 1.6;
+    text-rendering: optimizeLegibility;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    line-height: 1.18;
+    letter-spacing: -0.018em;
+    font-weight: 700;
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+
+  /* One focus ring for the whole app, and it is never removed. Keyboard and
+     screen-reader users are inside the accessibility requirement, not next to
+     it. `:focus-visible` so a mouse click does not draw it. */
+  :focus-visible {
+    outline: 2px solid var(--primary-ring);
+    outline-offset: 2px;
+    border-radius: 0.375rem;
+  }
+
+  ::selection {
+    background: var(--accent-soft);
+    color: var(--on-accent);
+  }
+
+  /* Inputs inherit nothing useful by default; this is cheaper than repeating
+     the same four utilities on every field. */
+  input,
+  textarea,
+  select,
+  button {
+    font: inherit;
+    color: inherit;
+  }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: 'Inter', sans-serif;
-  overflow-x: hidden;
+@layer components {
+  /* The one bespoke class in the app, because it cannot be expressed as
+     utilities: a soft radial wash behind the hero that has to sit under the
+     content and above the canvas. Everything else is utilities. */
+  .aurora {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(
+        60% 46% at 50% 0%,
+        color-mix(in oklch, var(--primary) 16%, transparent),
+        transparent 70%
+      ),
+      radial-gradient(
+        36% 32% at 88% 12%,
+        color-mix(in oklch, var(--accent) 20%, transparent),
+        transparent 70%
+      );
+    mask-image: linear-gradient(to bottom, black, transparent 88%);
+  }
+
+  /* Scroll containers inside cards. v1 referenced `custom-scrollbar` and never
+     defined it, so the modal had a default OS scrollbar in the middle of a
+     rounded card. */
+  .scroll-slim {
+    scrollbar-width: thin;
+    scrollbar-color: var(--line-strong) transparent;
+  }
+  .scroll-slim::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  .scroll-slim::-webkit-scrollbar-thumb {
+    background-color: var(--line-strong);
+    border-radius: 9999px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
 }
 
-/* ── Voice Orb Canvas ────────────────────────────────── */
-.voice-canvas {
-  display: block;
-  margin: 0 auto;
+/* ── Motion ───────────────────────────────────────────────────────────────
+   Hand-written rather than pulled in from a plugin. v1's components used
+   `animate-in fade-in zoom-in-95` from `tailwindcss-animate`, which was never
+   in package.json — so those animations silently did nothing. Three
+   keyframes cover everything this app actually animates.
+   ───────────────────────────────────────────────────────────────────────── */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
-/* ── Status Chip ─────────────────────────────────────── */
-.status-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 28px;
-  border-radius: 9999px;
-  font-size: 14px;
-  font-weight: 700;
-  letter-spacing: 2.5px;
-  text-transform: uppercase;
-  transition: all 0.4s ease;
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
-.status-chip.standby {
-  background: linear-gradient(135deg, #e0e7ff, #ede9fe);
-  color: #6366f1;
-  border: 1px solid #c7d2fe;
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.045);
+  }
 }
 
-.status-chip.listening {
-  background: linear-gradient(135deg, #dbeafe, #bfdbfe);
-  color: #2563eb;
-  border: 1px solid #93c5fd;
-  animation: pulse-chip 1.5s ease-in-out infinite;
+@keyframes shimmer {
+  to {
+    background-position: -200% 0;
+  }
 }
 
-.status-chip.processing {
-  background: linear-gradient(135deg, #fef3c7, #fde68a);
-  color: #d97706;
-  border: 1px solid #fcd34d;
-  animation: pulse-chip-amber 1.2s ease-in-out infinite;
+@utility animate-rise {
+  animation: rise 0.32s var(--ease-out-soft) both;
 }
 
-.status-chip.speaking {
-  background: linear-gradient(135deg, #d1fae5, #a7f3d0);
-  color: #059669;
-  border: 1px solid #6ee7b7;
+@utility animate-fade {
+  animation: fade 0.2s linear both;
 }
 
-@keyframes pulse-chip {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.3); }
-  50% { box-shadow: 0 0 0 8px rgba(59, 130, 246, 0); }
+@utility animate-breathe {
+  animation: breathe 2.6s ease-in-out infinite;
 }
 
-@keyframes pulse-chip-amber {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.3); }
-  50% { box-shadow: 0 0 0 8px rgba(245, 158, 11, 0); }
+@utility skeleton {
+  background-image: linear-gradient(
+    90deg,
+    var(--surface-2) 0%,
+    var(--surface-3) 40%,
+    var(--surface-2) 80%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.4s linear infinite;
 }
 
-/* ── Dot indicator ───────────────────────────────────── */
-.status-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  display: inline-block;
-}
-
-.status-dot.standby { background: #6366f1; }
-.status-dot.listening {
-  background: #3b82f6;
-  animation: blink-dot 1s ease-in-out infinite;
-}
-.status-dot.processing {
-  background: #f59e0b;
-  animation: spin-dot 0.8s linear infinite;
-}
-.status-dot.speaking { background: #10b981; }
-
-@keyframes blink-dot {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.3; }
-}
-
-@keyframes spin-dot {
-  0%, 100% { opacity: 1; transform: scale(1); }
-  50% { opacity: 0.4; transform: scale(0.6); }
-}
-
-/* ── Action Buttons ──────────────────────────────────── */
-.btn-primary {
-  display: inline-flex;
-  align-items: center;
-  gap: 12px;
-  padding: 18px 46px;
-  border-radius: 16px;
-  border: none;
-  cursor: pointer;
-  font-family: 'Inter', sans-serif;
-  font-size: 18px;
-  font-weight: 700;
-  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
-  position: relative;
-  overflow: hidden;
-}
-
-.btn-primary::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  border-radius: 16px;
-  opacity: 0;
-  transition: opacity 0.25s ease;
-}
-
-.btn-primary:hover::before {
-  opacity: 1;
-}
-
-.btn-start {
-  background: linear-gradient(135deg, #3b82f6, #2563eb);
-  color: white;
-  box-shadow: 0 4px 20px rgba(59, 130, 246, 0.35);
-}
-
-.btn-start:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 8px 30px rgba(59, 130, 246, 0.45);
-}
-
-.btn-start:active {
-  transform: translateY(0);
-}
-
-.btn-stop {
-  background: linear-gradient(135deg, #ef4444, #dc2626);
-  color: white;
-  box-shadow: 0 4px 20px rgba(239, 68, 68, 0.35);
-}
-
-.btn-stop:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 8px 30px rgba(239, 68, 68, 0.45);
-}
-
-/* ── Header ──────────────────────────────────────────── */
-.header {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  z-index: 100;
-  backdrop-filter: blur(16px) saturate(180%);
-  -webkit-backdrop-filter: blur(16px) saturate(180%);
-  background: rgba(248, 250, 255, 0.85);
-  border-bottom: 1px solid rgba(59, 130, 246, 0.08);
-}
-
-.subtitle-text {
-  font-size: 18px;
-  font-weight: 500;
-  transition: opacity 0.5s ease, transform 0.5s ease;
-}
-
-/* ── Custom scrollbar for light theme ─────────────────── */
-::-webkit-scrollbar {
-  width: 6px;
-}
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-::-webkit-scrollbar-thumb {
-  background: rgba(99, 102, 241, 0.2);
-  border-radius: 3px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(99, 102, 241, 0.35);
+/* Respect the OS setting. An orb that pulses forever is a vestibular problem
+   for some people and a battery problem for everyone. */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
