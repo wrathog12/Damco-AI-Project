@@ -168,29 +168,108 @@ def quota_exhausted_greeting(authenticated: bool) -> str:
             "your phone number to keep talking and get many more. Thank you!")
 
 
-def seed_messages() -> list[dict]:
+# ── Profile and recap (P3 slice 3) ──────────────────────
+# What a returning caller's session opens knowing. `services/profiles.py`
+# assembles the facts; the wording lives here because prompt text always does.
+#
+# Three rules are stated in it, and each one is a failure that happened or would
+# have:
+#
+#  1. **Confirm before acting on a fact.** The profile is what someone said on an
+#     earlier call, possibly months ago. Filing an application against a stale
+#     income figure is a worse outcome than one extra question, and a caller
+#     helping a relative is a common case that reads exactly like a stale profile.
+#  2. **Do not recite it.** A model handed a list of facts opens by reading them
+#     back, which on a shared or overheard phone announces the caller's caste and
+#     income to the room. It is also tedious.
+#  3. **Do not treat the recap as unfinished business.** "Last time we looked at
+#     Kanyashree" is context for *this* question, not a thread to resume — which
+#     is also why the previous transcript is persisted but never replayed.
+
+_FIELD_LABELS = {
+    "age": "age",
+    "gender": "gender",
+    "state": "state",
+    "income": "annual household income (₹)",
+    "occupation": "occupation",
+    "caste": "caste category",
+    "disability": "has a disability",
+    "bpl_card": "holds a BPL ration card",
+}
+
+
+def profile_notice(facts: dict, recent_schemes: list[str] | None = None) -> str:
+    """The one system message a returning caller's session starts with.
+
+    Kept deliberately short — it is paid for on every call of the session, like
+    everything else in the context — and it never contains an instruction that
+    contradicts `SYSTEM_PROMPT`, only facts plus how to treat them.
+    """
+    lines: list[str] = []
+
+    known = [(label, facts[key]) for key, label in _FIELD_LABELS.items()
+             if facts.get(key) is not None]
+    if known:
+        details = "; ".join(
+            f"{label}: {'yes' if value is True else 'no' if value is False else value}"
+            for label, value in known)
+        lines.append(
+            f"What this user told you on an earlier call — {details}. "
+            "Use these instead of asking again, and pass them to "
+            "check_eligibility yourself. Do NOT read this list back to them. "
+            "Before helping them apply for something, confirm the one or two "
+            "details that matter for it, in case anything has changed or they "
+            "are asking on someone else's behalf.")
+
+    if recent_schemes:
+        lines.append(
+            f"Schemes they looked at recently: {', '.join(recent_schemes)}. "
+            "Mention one only if it is relevant to what they ask now. This is "
+            "background, not an unfinished conversation to continue.")
+
+    return " ".join(lines)
+
+
+def seed_messages(profile_notice_text: str | None = None) -> list[dict]:
     """The opening `LLMContext` messages for a voice session.
 
     Few-shots only — no system message: that is `system_instruction` on the LLM
     service, which is a better home for it because context summarisation can
     rewrite messages but cannot touch the instruction.
 
+    The profile notice, when there is one, is prepended as a `system` message
+    *before* the few-shots. Before, because the few-shots end mid-exchange and a
+    fact inserted after them reads as part of the example conversation; and a
+    message rather than an addition to `system_instruction`, because the
+    instruction is one string shared by the whole process and this is per caller.
+
     A fresh list every call. Handing the same list to two sessions would let
     each session's aggregator append the other's turns to it, which is exactly
     the process-global `conversation_history` bug v2 exists to remove.
     """
-    return copy.deepcopy(FEW_SHOT_EXAMPLES)
+    messages = copy.deepcopy(FEW_SHOT_EXAMPLES)
+    if profile_notice_text:
+        messages.insert(0, {"role": "system", "content": profile_notice_text})
+    return messages
 
 
-def build_messages(conversation_history: list[dict]) -> list[dict]:
+def build_messages(conversation_history: list[dict],
+                   *, profile_notice: str | None = None) -> list[dict]:
     """
     Build the final message list for the LLM:
-    [system] + [few-shot examples] + [actual conversation]
+    [system] + [profile] + [few-shot examples] + [actual conversation]
 
     The few-shot examples are stripped after the first real tool call
     to avoid bloating context in long conversations.
+
+    `profile_notice` is *not* truncated away with the history: `voice/llm.py`
+    passes it on every turn, so the agent does not forget who it is talking to
+    eleven turns into a text conversation.
     """
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    if profile_notice:
+        messages.append({"role": "system", "content": profile_notice})
 
     # Only include few-shot examples if conversation is short
     if len(conversation_history) < 6:

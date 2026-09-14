@@ -22,13 +22,19 @@ needed. Worth being explicit about what is gone, because each one was a real bug
 
 The pipeline:
 
-    transport.input → STT → LanguageTagger → user aggregator → QuotaGate
-                    → LLM → TTS → transport.output → CallCloser
+    transport.input → STT → LanguageTagger → [tap] → user aggregator → QuotaGate
+                    → LLM → TTS → transport.output → CallCloser → [tap]
                     → assistant aggregator
 
 The RTVI processor is prepended by `PipelineWorker` itself (`enable_rtvi`), so
 `worker.rtvi.send_server_message(...)` reaches the client without being wired in
 here.
+
+The two `[tap]`s are the transcript recorder, and they are only in the pipeline
+when there is something to record — see `TranscriptRecorder` for why there are two
+of them and `services/conversations.py` for who may be recorded at all. A session
+also opens with the caller's profile injected ahead of the few-shots, which is what
+stops the agent asking a returning caller which state they are from.
 """
 import asyncio
 import uuid
@@ -42,7 +48,10 @@ from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     EndWorkerFrame,
     Frame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
+    LLMTextFrame,
     TranscriptionFrame,
     TTSSpeakFrame,
     TTSUpdateSettingsFrame,
@@ -63,6 +72,8 @@ from pipecat.workers.runner import WorkerRunner
 
 from config import settings as cfg
 from models.identity import User
+from services import conversations as conv_service
+from services import profiles as profile_service
 from services import quota
 from services.resources import Resources
 from tools.end_call import END_EVENT
@@ -188,6 +199,99 @@ class CallCloser(FrameProcessor):
             await self.push_frame(EndWorkerFrame(reason="end_call"), direction)
 
 
+class TranscriptRecorder:
+    """Collects the call's transcript, in order, for `services/conversations.py`.
+
+    **Hand-rolled deliberately.** Pipecat 1.9 has no `TranscriptProcessor` —
+    `pipecat.processors.transcript_processor` does not exist and nothing in the
+    installed package emits a `TranscriptionMessage` or an `on_transcript_update`
+    event. So this joins `LanguageTagger`, `CallCloser` and `QuotaGate` as local
+    logic, and it is written to survive the frames it does not understand.
+
+    Two sources, because no single point in the pipeline sees both sides:
+
+    * The **user's** words come from `TranscriptionFrame`, which the user
+      aggregator *consumes* rather than forwards — verified in
+      `llm_response_universal.py`, where interim and final transcriptions are
+      explicitly not pushed downstream. So that half has to be observed before the
+      aggregator.
+    * The **agent's** words come from `LLMTextFrame` between
+      `LLMFullResponseStartFrame` and `LLMFullResponseEndFrame`, downstream of the
+      LLM. Not `TTSTextFrame`: with a service that reports word timestamps —
+      Cartesia does — those arrive one word at a time with their own spacing
+      rules, so reassembling a sentence from them is fiddly for no gain.
+
+    Hence a recorder plus two `TranscriptTap`s rather than one processor.
+
+    Two honest limitations, both accepted:
+
+    * A reply the caller **barges in on** is recorded in full, because this
+      observes what the model produced rather than what the speaker finished
+      saying. The alternative is reconstructing playback position from word
+      timestamps, which is a lot of machinery to make a stored transcript
+      marginally more accurate about a sentence nobody disputed.
+    * Rows are written **once, at hang-up**. A process killed mid-call loses that
+      call's transcript. That is the right trade here: the transcript is a
+      convenience, while the things that actually change what the agent knows next
+      time — the profile and the scheme interactions — are written eagerly, as
+      they happen.
+    """
+
+    def __init__(self) -> None:
+        self.turns: list[tuple[str, str]] = []
+        self.turn_count = 0
+        self.language: str | None = None
+        self._reply: list[str] = []
+        self._in_reply = False
+
+    def observe_user(self, frame: Frame) -> None:
+        if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            self.turns.append(("user", frame.text.strip()))
+            self.turn_count += 1
+            code = _language_code(frame.language)
+            if code:
+                # The last language heard, not the first: it is what the recap for
+                # the *next* call should be written in.
+                self.language = code
+
+    def observe_bot(self, frame: Frame) -> None:
+        if isinstance(frame, LLMFullResponseStartFrame):
+            self._reply = []
+            self._in_reply = True
+        elif isinstance(frame, LLMTextFrame) and self._in_reply:
+            self._reply.append(frame.text)
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            self._in_reply = False
+            text = "".join(self._reply).strip()
+            self._reply = []
+            if text:
+                # A turn that only called a tool produces no text, and a blank row
+                # in a transcript reads as a pause that never happened.
+                self.turns.append(("assistant", text))
+
+
+class TranscriptTap(FrameProcessor):
+    """A pass-through that shows every frame to a recorder and changes nothing.
+
+    Separate from the recorder so the same recorder can be watched from two points
+    in the pipeline, and so the observation can never alter the frame: this class
+    has no branch that skips `push_frame`.
+    """
+
+    def __init__(self, observe) -> None:
+        super().__init__()
+        self._observe = observe
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        try:
+            self._observe(frame)
+        except Exception as exc:                                # noqa: BLE001
+            # A recording bug must never break a live call.
+            logger.warning(f"transcript tap: {type(exc).__name__}: {exc}")
+        await self.push_frame(frame, direction)
+
+
 def _build_services() -> tuple[DeepgramSTTService, GoogleLLMService, CartesiaTTSService]:
     stt = DeepgramSTTService(
         api_key=cfg.deepgram_api_key,
@@ -258,7 +362,19 @@ async def run_session(
     transport = create_transport(webrtc_connection=webrtc_connection)
     stt, llm, tts = _build_services()
 
-    context = LLMContext(messages=seed_messages(), tools=TOOL_SCHEMAS)
+    # The whole point of P3 slice 3: a returning caller's session starts already
+    # knowing their state and age, so the agent stops asking. `session_context`
+    # returns None for an anonymous caller, for one with no profile, and when no
+    # encryption key is configured — in all three cases this is exactly the P2
+    # pipeline, which is why nothing below is conditional on it.
+    notice = await profile_service.session_context(resources, user)
+    if notice:
+        log.info(f"restored profile context for user {user.id}")
+    persist = await conv_service.start(resources, user, channel="voice",
+                                       conversation_id=conversation_id)
+    recorder = TranscriptRecorder() if persist else None
+
+    context = LLMContext(messages=seed_messages(notice), tools=TOOL_SCHEMAS)
     aggregators = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
@@ -283,18 +399,28 @@ async def run_session(
 
     # `deliver` is filled in below — the callback needs the worker, and the
     # worker needs this object as its app_resources.
-    tool_ctx = ToolContext(resources=resources)
+    #
+    # `user` is what makes `check_eligibility` answerable from memory and what
+    # attributes a card to the person who saw it; `conversation_id` is what ties an
+    # interaction to the call it happened on.
+    tool_ctx = ToolContext(resources=resources, user=user,
+                           conversation_id=conversation_id)
 
     pipeline = Pipeline([
         transport.input(),
         stt,
         tagger,
+        # Before the user aggregator, which consumes TranscriptionFrame rather than
+        # forwarding it — see TranscriptRecorder.
+        *([TranscriptTap(recorder.observe_user)] if recorder else []),
         aggregators.user(),
         gate,
         llm,
         tts,
         transport.output(),
         closer,
+        # After the LLM, where the reply text is visible.
+        *([TranscriptTap(recorder.observe_bot)] if recorder else []),
         aggregators.assistant(),
     ])
 
@@ -308,10 +434,18 @@ async def run_session(
         params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
     )
 
+    # Why the call ended, as far as we observed it. A one-element list rather than
+    # a `nonlocal`, because `deliver` is defined before the handlers that would
+    # need to see the assignment. Defaults to "disconnect": a caller who closes
+    # the tab tells us nothing, and guessing a friendlier reason would make the
+    # stored `end_reason` useless for telling a finished call from a dropped one.
+    ended = ["disconnect"]
+
     async def deliver(event: dict[str, Any]) -> None:
         """The session's own channel to its own client — nobody else's."""
         await worker.rtvi.send_server_message(event)
         if event.get("type") == END_EVENT:
+            ended[0] = str(event.get("reason") or "end_call")
             closer.arm()
 
     tool_ctx.deliver = deliver
@@ -392,3 +526,18 @@ async def run_session(
         await runner.run(worker)
     finally:
         log.info("session end")
+        if recorder is not None:
+            # In the `finally` so a call that ended badly is still recorded, and
+            # wrapped because a failed write must not turn a completed call into an
+            # exception propagating out of the request handler that started it.
+            try:
+                stored = await conv_service.append(
+                    resources, conversation_id, recorder.turns)
+                await conv_service.finish(
+                    resources, conversation_id, reason=ended[0],
+                    turn_count=recorder.turn_count, language=recorder.language)
+                log.info(f"stored {stored} transcript messages "
+                         f"({recorder.turn_count} turns, {ended[0]})")
+            except Exception as exc:                            # noqa: BLE001
+                log.error(f"could not store the transcript: "
+                          f"{type(exc).__name__}: {exc}")

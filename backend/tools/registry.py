@@ -30,6 +30,10 @@ from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter
 from pipecat.services.llm_service import FunctionCallParams
 
+from models.identity import User
+from services import conversations as conv_service
+from services import eligibility as eligibility_service
+from services import profiles as profile_service
 from services.resources import Resources
 from tools.card import show_scheme_card
 from tools.details import get_scheme_details
@@ -48,9 +52,20 @@ class ToolContext:
     client (a script, a test); the two tools that use it degrade to returning
     their result and skipping the UI event, which is the correct behaviour for a
     caller that has no screen.
+
+    `user` is who the session belongs to, and it is what lets `check_eligibility`
+    be called with a scheme id alone. It is optional for the same reason `deliver`
+    is: a script or a `/health`-style probe has no caller, and a tool that raised
+    without one would make the whole tool table untestable. The tools degrade to
+    exactly the P2 behaviour — no memory, everything asked for explicitly.
+
+    `conversation_id` travels with it so an interaction can be attributed to the
+    call it happened on without the tool having to reach into the pipeline.
     """
     resources: Resources
     deliver: Deliver | None = None
+    user: User | None = None
+    conversation_id: str | None = None
 
 
 Core = Callable[[ToolContext, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -66,11 +81,49 @@ async def _details(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _card(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
-    return await show_scheme_card(ctx.resources, deliver=ctx.deliver, **args)
+    result = await show_scheme_card(ctx.resources, deliver=ctx.deliver, **args)
+    # Recorded after the fact and never allowed to affect it: a card that reached
+    # the caller's screen is the strongest signal of interest this system gets, and
+    # it is also the cheapest memory to keep (see models/profile.py). `error` in
+    # the result means no card was shown, so there is nothing to remember.
+    if ctx.user is not None and "error" not in result and args.get("scheme_id"):
+        await conv_service.record_interaction(
+            ctx.resources, ctx.user, scheme_id=args["scheme_id"],
+            kind="card_shown", conversation_id=ctx.conversation_id)
+    return result
 
 
 async def _eligibility(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
-    return await check_eligibility(ctx.resources, **args)
+    """Fills the gaps from the profile, then records the verdict.
+
+    This is where "call check_eligibility with no arguments" actually becomes
+    true. The loading is here rather than in `tools/eligibility.py` because that
+    module has no business knowing there is such a thing as a logged-in user —
+    it evaluates rules against facts, and the registry is the layer that already
+    knows whose session this is.
+    """
+    profile = None
+    if ctx.user is not None:
+        profile = await profile_service.load(ctx.resources, ctx.user)
+
+    result = await check_eligibility(
+        ctx.resources,
+        profile_facts=profile_service.eligibility_args(profile),
+        **args)
+
+    if ctx.user is not None and "error" not in result:
+        await conv_service.record_interaction(
+            ctx.resources, ctx.user, scheme_id=result["scheme_id"],
+            kind="eligibility_checked", conversation_id=ctx.conversation_id)
+        # Only cache a verdict computed from the *stored* facts alone. One that
+        # used a value the model supplied this turn is not reproducible from the
+        # profile, so filing it under `profile_version` would make the cache claim
+        # something the profile does not say.
+        if profile is not None and not any(k.startswith("user_") for k in args):
+            await eligibility_service.remember(
+                ctx.resources, ctx.user, result,
+                profile_version=profile.version)
+    return result
 
 
 async def _end_call(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
@@ -235,7 +288,10 @@ TOOL_SCHEMAS: list[FunctionSchema] = [
         name="check_eligibility",
         description=(
             "Check whether the user qualifies for one scheme. Use when they ask "
-            "'am I eligible?' or give their age/income/state/gender."
+            "'am I eligible?' or give their age/income/state/gender. Details the "
+            "user has given on an earlier call are filled in automatically, so "
+            "scheme_id alone is enough — pass a value only when they state it in "
+            "this conversation, and it will override what is remembered."
         ),
         properties={
             "scheme_id": {"type": "string"},
@@ -244,6 +300,16 @@ TOOL_SCHEMAS: list[FunctionSchema] = [
             "user_state": {"type": "string"},
             "user_income": {"type": "integer", "description": "Annual, in INR"},
             "user_occupation": {"type": "string"},
+            # Additive — the five names are the stable contract, the argument
+            # lists are allowed to grow. These two exist because the profile now
+            # stores them and `evaluate_eligibility` now enforces them: a caste
+            # the model heard this turn must be able to reach the rules, or the
+            # only way to correct a stale one would be to edit the profile.
+            "user_caste": {
+                "type": "string",
+                "description": "SC, ST, OBC, General or EWS",
+            },
+            "user_disability": {"type": "boolean"},
         },
         required=["scheme_id"],
         handler=_make_handler("check_eligibility"),

@@ -564,12 +564,7 @@ def _matches_any(value: str, options: Iterable[str] | None) -> bool:
 async def evaluate_eligibility(
     res: Resources,
     scheme_id: str,
-    *,
-    user_age: int | None = None,
-    user_gender: str | None = None,
-    user_state: str | None = None,
-    user_income: int | None = None,
-    user_occupation: str | None = None,
+    **facts: Any,
 ) -> dict[str, Any] | None:
     """`{eligible, scheme_id, scheme_name, reasons[]}` — the v1 contract.
 
@@ -578,16 +573,38 @@ async def evaluate_eligibility(
     check whose scheme-side value is NULL is skipped entirely, because telling
     someone they are ineligible on the strength of missing data is the one
     failure this system must not produce.
+
+    One database read, then `evaluate_scheme`. The split exists so that
+    `services/eligibility.py` can score the whole corpus from a single `SELECT`
+    instead of 1,786 lookups — the rules themselves have no reason to touch the
+    database, and keeping them in one function is what stops the bulk path and the
+    single-scheme path drifting into two different verdicts for one caller.
     """
     scheme = await _by_id(res, scheme_id)
     if scheme is None:
         return None
+    return evaluate_scheme(scheme, **facts)
 
+
+def evaluate_scheme(
+    scheme: Scheme,
+    *,
+    user_age: int | None = None,
+    user_gender: str | None = None,
+    user_state: str | None = None,
+    user_income: int | None = None,
+    user_occupation: str | None = None,
+    user_caste: str | None = None,
+    user_disability: bool | None = None,
+    user_bpl_card: bool | None = None,
+) -> dict[str, Any]:
+    """The rules, against a scheme already loaded. Pure and synchronous."""
     # Same normalisation as `search`, for the same reason: a caller who says
     # "main kisan hoon" must not be told a farmer scheme targets someone else.
     user_gender = _dealias("gender", user_gender)
     user_occupation = _dealias("occupation", user_occupation)
     user_state = _dealias("state", user_state)
+    user_caste = _dealias("caste", user_caste)
 
     reasons: list[str] = []
     eligible = True
@@ -655,6 +672,50 @@ async def evaluate_eligibility(
         else:
             reasons.append(f"Occupation: scheme targets {stated} — "
                            f"confirm whether '{user_occupation}' qualifies")
+
+    if user_caste:
+        # Enforced, unlike occupation, and that asymmetry is deliberate: `caste`
+        # is a curated keyword array from myScheme's own eligibility facets, not a
+        # regex guess at prose, so a mismatch really does mean the scheme is
+        # reserved for another category. It became necessary the moment the
+        # profile started carrying caste — a stored "General" silently ignored
+        # here would have the agent telling a General-caste caller they qualify
+        # for an SC-only scholarship, which is worse than not knowing their caste
+        # at all. Empty array still means "open to all" (rule: NULL does not
+        # exclude), and `_matches_any` honours a literal "All".
+        if not scheme.caste:
+            reasons.append("Caste category: ✓ open to all")
+        elif _matches_any(user_caste, scheme.caste):
+            reasons.append(f"Caste category '{user_caste}': ✓ eligible")
+        else:
+            eligible = False
+            reasons.append(f"Caste category '{user_caste}' not eligible "
+                           f"(reserved for {list(scheme.caste)})")
+
+    if user_disability is not None:
+        # `Scheme.disability` is tri-state and only `True` is a requirement:
+        # `None` means the corpus says nothing and `False` means the scheme is not
+        # disability-specific — neither is a reason to exclude anybody. So a
+        # caller *with* a disability is never made ineligible by this check; only
+        # a caller without one, against a scheme that requires one.
+        if scheme.disability is not True:
+            reasons.append("Disability: not a requirement of this scheme")
+        elif user_disability:
+            reasons.append("Disability: ✓ this scheme is for persons with "
+                           "disabilities")
+        else:
+            eligible = False
+            reasons.append("This scheme is only for persons with disabilities")
+
+    if user_bpl_card is not None:
+        # Same tri-state reading as `disability`.
+        if scheme.bpl_card is not True:
+            reasons.append("BPL card: not a requirement of this scheme")
+        elif user_bpl_card:
+            reasons.append("BPL card: ✓ required and held")
+        else:
+            eligible = False
+            reasons.append("This scheme requires a BPL ration card")
 
     if scheme.delisted_at is not None:
         eligible = False

@@ -204,6 +204,7 @@ async def chat(
     user_message: str,
     conversation_history: list[dict],
     detected_language: str = "en",
+    profile_notice: str | None = None,
 ) -> tuple[str, list[dict]]:
     """One text turn, tools included. Returns `(reply, history)`.
 
@@ -216,10 +217,19 @@ async def chat(
     states its language in the request and the model reads it from the message
     itself. The voice path's language tag now lives in `voice/pipeline.py`, where
     the STT result actually is.
+
+    `profile_notice` is the caller's stored details, from
+    `services/profiles.py::session_context`. It is an argument rather than
+    something prepended to `conversation_history` on purpose: the history is
+    handed back to the client and echoed on the next request, so a system message
+    inside it would put our own prompt text into the client's transcript and
+    re-send it every turn — the same mistake v1 made by pasting
+    `[User is speaking Hindi]` onto the front of the user's words.
     """
     conversation_history.append({"role": "user", "content": user_message})
 
-    system, contents = _to_contents(build_messages(conversation_history))
+    system, contents = _to_contents(
+        build_messages(conversation_history, profile_notice=profile_notice))
     response = await _complete(system, contents)
 
     rounds = 0

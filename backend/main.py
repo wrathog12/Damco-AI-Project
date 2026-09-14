@@ -1,14 +1,20 @@
 """
 Bhasha-Agent backend — FastAPI + Pipecat.
 
-    GET    /health          corpus stats and data-layer status
-    POST   /chat            text tool-calling; the fastest way to exercise the tools
-    GET    /api/quota       turns left, and the request that establishes an identity
-    GET    /api/me          who the caller is, and what they have consented to
-    DELETE /api/me          erasure (DPDP Act 2023)
-    POST   /api/offer       WebRTC signalling — starts one voice session per caller
-    PATCH  /api/offer       trickle ICE for the above
-    GET    /client          Pipecat's prebuilt dev UI, for testing without the frontend
+    GET    /health              corpus stats, data-layer status, retention policy
+    POST   /chat                text tool-calling; the fastest way to exercise the tools
+    GET    /api/quota           turns left, and the request that establishes an identity
+    GET    /api/me              who the caller is, and what they have consented to
+    DELETE /api/me              erasure (DPDP Act 2023)
+    POST   /api/me/consent      agree to the current privacy notice
+    GET    /api/me/profile      the caller's stored details
+    PUT    /api/me/profile      save some of them (patch, not replace)
+    DELETE /api/me/profile      forget them, keeping the account
+    DELETE /api/me/history      forget the transcripts and scheme history
+    GET    /api/me/eligible     which schemes the stored profile qualifies for
+    POST   /api/offer           WebRTC signalling — starts one voice session per caller
+    PATCH  /api/offer           trickle ICE for the above
+    GET    /client              Pipecat's prebuilt dev UI, for testing without the frontend
 
     POST /api/auth/request-otp | verify-otp | refresh | logout   — see auth/routes.py
 
@@ -16,11 +22,21 @@ Every endpoint that costs a turn resolves a caller first, and resolving one neve
 fails: anonymous is the default state, not a rejected login. See `auth/` for who
 they are and `services/quota.py` for what they are allowed.
 
-The four `/api/auth` endpoints are the **only** ones that refuse a caller. Being
-wrong about a one-time code is not the same as asking for a service, so those
-return 400/401/429 while everything else answers 200 and explains itself in the
-body — a rule worth keeping, because the moment a second endpoint 401s the client
-needs a global error path and the anonymous-first promise starts leaking.
+**The conversational surface never refuses a caller; the account surface may.**
+`/chat`, `/api/quota` and `/api/offer` always answer 200 and explain themselves in
+the body — that is the anonymous-first promise, and the moment one of them 401s a
+first-time caller meets an error instead of the product. `/api/auth/*` and
+`/api/me*` are a different surface: being wrong about a one-time code, or asking
+for personal data that belongs to an account you have not proved you hold, is not
+the same as asking for a service. They return 400/401/403/429 through the single
+`AuthError` handler below.
+
+That is a **correction** to the narrower rule this docstring used to state ("the
+four `/api/auth` endpoints are the only ones that refuse a caller"). It was
+already untrue when `DELETE /api/me` started requiring a token in slice 2, and
+slice 3 — 401 on reading a profile, 403 `consent_required` on writing one — makes
+it untenable. The distinction that survives is the one above, and it is the one
+worth defending.
 
 Gone from v1, deliberately: `/rtc/webrtc/offer` (FastRTC), `/gradio` (a second
 Stream with its own divergent VAD tuning), and `/ws/cards` with its process-wide
@@ -30,9 +46,11 @@ transport, so a card cannot land on a stranger's screen.
 Resources — the Postgres pool, the Qdrant client, the embedder — are created once
 here and handed to each session. Nothing reads them from a module global.
 """
+import asyncio
 import time
 import uuid
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -47,15 +65,19 @@ from pipecat.transports.smallwebrtc.request_handler import (
     SmallWebRTCRequestHandler,
 )
 
-from auth import anon, tokens
+from auth import anon, crypto, tokens
 from auth import routes as auth_routes
 from auth.identity import current_user, token_verified
 from auth.phone import mask
 from config import settings
 from models.identity import User
 from services import auth as auth_service
+from services import conversations as conv_service
+from services import eligibility as eligibility_service
+from services import profiles as profile_service
 from services import quota
 from services import resources as resource_factory
+from services import retention
 from services import schemes as scheme_service
 from tools.card import CARD_EVENT
 from tools.events import EventCollector
@@ -86,7 +108,29 @@ async def lifespan(app: FastAPI):
 
     logger.info(f"llm={settings.llm_model} transport={settings.transport}")
 
+    # Said once at boot, because from the outside an unset key looks like a
+    # working app that simply never remembers anything.
+    if crypto.available():
+        logger.info(f"[privacy] profile encryption on (key "
+                    f"{crypto.fingerprint()}), retention {retention.policy()}")
+    else:
+        logger.warning("[privacy] PROFILE_ENCRYPTION_KEY unset — no profiles and "
+                       "no transcripts will be stored")
+
+    # The retention sweep runs from the app, not from a cron job somebody has to
+    # remember to install: a documented policy that only some deployments enforce
+    # is not a policy. It is a task rather than an `await` so boot is not delayed
+    # by a DELETE over a large table.
+    sweeper = asyncio.create_task(retention.run_forever(app.state.resources),
+                                  name="retention-sweep")
+
     yield
+
+    sweeper.cancel()
+    try:
+        await sweeper
+    except asyncio.CancelledError:
+        pass
 
     await llm.close_client()
     await app.state.resources.close()
@@ -148,6 +192,14 @@ async def health():
         "semantic_search": stats["semantic_search"],
         "states": stats["states"],
         "categories": stats["categories"],
+        # Published rather than only documented: a privacy notice that states a
+        # number nothing enforces is worse than one that states nothing, so the
+        # notice and this endpoint read the same source (services/retention.py).
+        "privacy": {
+            "profiles_enabled": crypto.available(),
+            "consent_version": settings.consent_version,
+            "retention": retention.policy(),
+        },
     }
 
 
@@ -156,6 +208,15 @@ class ChatRequest(BaseModel):
     message: str
     history: list[dict] = []
     language: str = "en"
+    # Send the same id on every turn of a thread and the thread is persisted the
+    # way a voice call is. Omit it and nothing is stored, which keeps every
+    # existing caller of this endpoint behaving exactly as it did.
+    #
+    # It is also what makes slice 3 verifiable without a live WebRTC call: the
+    # persistence path can be exercised over cheap HTTP instead of synthesising
+    # speech through aiortc. That it doubles as the foundation of P4's text/browse
+    # mode is the reason it is a real feature rather than a test hook.
+    conversation_id: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -166,6 +227,10 @@ class ChatResponse(BaseModel):
     # Present on every reply so a client can show the allowance without polling
     # a second endpoint. `quota.allowed` false means this reply is the refusal.
     quota: dict = {}
+    # Echoed back when the thread is being persisted, absent when it is not — so a
+    # client can tell "this conversation is remembered" from "this one is not"
+    # without knowing the rules about phone numbers and encryption keys.
+    conversation_id: str | None = None
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -178,6 +243,10 @@ async def chat_endpoint(req: ChatRequest, user: User = Depends(current_user)):
 
     A text turn spends from the same allowance a spoken one does. Anything else
     would make `/chat` the way around the quota, and it is a public endpoint.
+
+    Pass `conversation_id` and the thread is persisted and the caller's stored
+    profile is injected, exactly as on the voice path. Both are silently skipped
+    for a caller who has no account to hang them off.
     """
     verdict = await quota.consume(app.state.resources, user)
 
@@ -192,8 +261,18 @@ async def chat_endpoint(req: ChatRequest, user: User = Depends(current_user)):
             quota=_quota_payload(verdict),
         )
 
+    persisting = False
+    if req.conversation_id:
+        persisting = await conv_service.start(
+            app.state.resources, user, channel="text",
+            conversation_id=req.conversation_id)
+
+    notice = await profile_service.session_context(app.state.resources, user)
+
     collector = EventCollector()
-    ctx = ToolContext(resources=app.state.resources, deliver=collector)
+    ctx = ToolContext(resources=app.state.resources, deliver=collector,
+                      user=user,
+                      conversation_id=req.conversation_id if persisting else None)
 
     t0 = time.perf_counter()
     response_text, history = await llm.chat(
@@ -201,8 +280,26 @@ async def chat_endpoint(req: ChatRequest, user: User = Depends(current_user)):
         user_message=req.message,
         conversation_history=req.history.copy(),
         detected_language=req.language,
+        profile_notice=notice,
     )
     llm_ms = round((time.perf_counter() - t0) * 1000)
+
+    if persisting:
+        # After the reply is in hand, and not allowed to fail the turn: an answer
+        # the caller already has cannot be un-given because a row would not write.
+        try:
+            await conv_service.append(
+                app.state.resources, req.conversation_id,
+                conv_service.turn_pairs(req.message, response_text))
+            # A text thread has no hang-up, so every turn stamps the end. The row
+            # therefore always reflects the last turn that happened, which is the
+            # closest thing to an end this channel has.
+            await conv_service.finish(
+                app.state.resources, req.conversation_id, reason="text_turn",
+                language=req.language)
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning(f"could not persist the text turn: "
+                           f"{type(exc).__name__}: {exc}")
 
     return ChatResponse(
         response=response_text,
@@ -210,6 +307,7 @@ async def chat_endpoint(req: ChatRequest, user: User = Depends(current_user)):
         timings={"llm_ms": llm_ms},
         card=collector.first(CARD_EVENT),
         quota=_quota_payload(verdict),
+        conversation_id=req.conversation_id if persisting else None,
     )
 
 
@@ -242,13 +340,153 @@ async def me(user: User = Depends(current_user),
     before there is anything sensitive behind it.
     """
     allowance = await quota.peek(app.state.resources, user)
+
+    # The profile itself is not here — `GET /api/me/profile` is — but whether
+    # there is one has to be, or a client cannot decide between "fill this in"
+    # and "review this" without asking for the sensitive payload first.
+    profile = await profile_service.load(app.state.resources, user) if verified else None
+    eligible_count = (await eligibility_service.cached_count(
+        app.state.resources, user, profile) if profile else None)
+
     return {
         "authenticated": verified,
         "phone": mask(user.phone_e164) if verified else None,
-        "consent": {"version": user.consent_version,
-                    "at": user.consent_at.isoformat() if user.consent_at else None},
+        "consent": {
+            "version": user.consent_version,
+            "at": user.consent_at.isoformat() if user.consent_at else None,
+            # Not `version is not None`: publishing a new notice has to make every
+            # existing agreement stale, and a client that only checked for presence
+            # would never show the new one.
+            "current": profile_service.consent_current(user),
+            "required_version": settings.consent_version,
+        },
+        "profile": {
+            "supported": crypto.available(),
+            "has_profile": profile is not None,
+            "fields": list(profile.known) if profile else [],
+            "updated_at": (profile.updated_at.isoformat()
+                           if profile and profile.updated_at else None),
+            # None means "not worked out yet", which is a different thing to show
+            # someone than zero. See services/eligibility.py::cached_count.
+            "eligible_count": eligible_count,
+        },
         "quota": _quota_payload(allowance),
     }
+
+
+# ── Consent, profile, memory ────────────────────────────
+# Everything below discloses or stores sensitive personal data, so all of it
+# requires a *verified access token* rather than merely an identity that happens
+# to carry a phone number (see `GET /api/me`). This is the account surface, and
+# the account surface is allowed to refuse — the conversational surface
+# (`/chat`, `/api/quota`, `/api/offer`) still never does.
+
+def _require_verified(verified: bool) -> None:
+    if not verified:
+        raise auth_service.AuthError(
+            401, "not_authenticated",
+            "Sign in with your phone number to see or change your details.")
+
+
+@app.post("/api/me/consent")
+async def accept_consent(user: User = Depends(current_user),
+                         verified: bool = Depends(token_verified)):
+    """Record agreement to the current privacy notice.
+
+    A separate call rather than a flag on the first profile write, because DPDP
+    consent has to be a deliberate act with a timestamp against a version — not
+    something inferred from someone filling in a form. `services/profiles.py`
+    enforces it on every write path, including P5's background extractor.
+    """
+    _require_verified(verified)
+    at = await profile_service.record_consent(app.state.resources, user)
+    return {"consent": {"version": settings.consent_version,
+                        "at": at.isoformat(), "current": True}}
+
+
+@app.get("/api/me/profile")
+async def get_profile(user: User = Depends(current_user),
+                      verified: bool = Depends(token_verified)):
+    """The caller's stored details, decrypted, in full.
+
+    The DPDP right of access. Full values, not the masked summary `GET /api/me`
+    carries: this is the caller asking to see their own data, and showing them a
+    redacted version of it would defeat the point of the right.
+    """
+    _require_verified(verified)
+    profile = await profile_service.load(app.state.resources, user)
+    return {
+        "supported": crypto.available(),
+        "has_profile": profile is not None,
+        "facts": profile.facts if profile else {},
+        "fields": list(profile_service.FIELDS),
+        "version": profile.version if profile else 0,
+        "consent_version": profile.consent_version if profile else None,
+        "updated_at": (profile.updated_at.isoformat()
+                       if profile and profile.updated_at else None),
+        "retention": "kept until you delete it; transcripts expire on their own",
+    }
+
+
+@app.put("/api/me/profile")
+async def put_profile(patch: dict[str, Any], user: User = Depends(current_user),
+                      verified: bool = Depends(token_verified)):
+    """Merge details into the profile. PUT, but a patch — see `profiles.save`.
+
+    The body is taken as a plain object rather than a Pydantic model on purpose:
+    `profiles._clean` already owns validation, and it answers with this app's own
+    400 shape (`unknown_fields`, `bad_value`) and a sentence a client can show a
+    user. A model here would pre-empt it with a 422 nobody can render.
+
+    Saving invalidates the cached eligibility verdicts — inside `profiles.save`,
+    not here, because their reasons quote facts that any writer can change.
+    """
+    _require_verified(verified)
+    profile = await profile_service.save(app.state.resources, user, patch)
+    return {
+        "saved": True,
+        "facts": profile.facts,
+        "version": profile.version,
+        "updated_at": profile.updated_at.isoformat() if profile.updated_at else None,
+    }
+
+
+@app.delete("/api/me/profile")
+async def delete_profile(user: User = Depends(current_user),
+                         verified: bool = Depends(token_verified)):
+    """Forget the caller's details, keeping their account and their allowance."""
+    _require_verified(verified)
+    removed = await profile_service.erase(app.state.resources, user)
+    return {"deleted": removed}
+
+
+@app.delete("/api/me/history")
+async def delete_history(user: User = Depends(current_user),
+                         verified: bool = Depends(token_verified)):
+    """Forget what was said and what was looked at, keeping the account.
+
+    The third of the three erasure granularities, and they are three rather than
+    one because they are three different things a person might want: forget this
+    conversation, forget what you know about me, close my account.
+    """
+    _require_verified(verified)
+    removed = await conv_service.erase_all(app.state.resources, user)
+    return {"deleted": removed}
+
+
+@app.get("/api/me/eligible")
+async def eligible_schemes(limit: int = 20, user: User = Depends(current_user),
+                           verified: bool = Depends(token_verified)):
+    """Every scheme the caller's stored profile qualifies them for.
+
+    Deterministic rules over the live corpus, never vector similarity — a verdict
+    a citizen may act on cannot come from a ranking. `eligible_count` of 0 with an
+    empty `profile_fields` means there is nothing stored to evaluate against, not
+    that they qualify for nothing.
+    """
+    _require_verified(verified)
+    return await eligibility_service.evaluate_all(
+        app.state.resources, user, limit=max(1, min(limit, 100)))
 
 
 @app.delete("/api/me")
