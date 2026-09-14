@@ -1,16 +1,26 @@
 """
 Bhasha-Agent backend — FastAPI + Pipecat.
 
-    GET   /health      corpus stats and data-layer status
-    POST  /chat        text tool-calling; the fastest way to exercise the tools
-    GET   /api/quota   turns left, and the request that establishes an identity
-    POST  /api/offer   WebRTC signalling — starts one voice session per caller
-    PATCH /api/offer   trickle ICE for the above
-    GET   /client      Pipecat's prebuilt dev UI, for testing without the frontend
+    GET    /health          corpus stats and data-layer status
+    POST   /chat            text tool-calling; the fastest way to exercise the tools
+    GET    /api/quota       turns left, and the request that establishes an identity
+    GET    /api/me          who the caller is, and what they have consented to
+    DELETE /api/me          erasure (DPDP Act 2023)
+    POST   /api/offer       WebRTC signalling — starts one voice session per caller
+    PATCH  /api/offer       trickle ICE for the above
+    GET    /client          Pipecat's prebuilt dev UI, for testing without the frontend
+
+    POST /api/auth/request-otp | verify-otp | refresh | logout   — see auth/routes.py
 
 Every endpoint that costs a turn resolves a caller first, and resolving one never
 fails: anonymous is the default state, not a rejected login. See `auth/` for who
 they are and `services/quota.py` for what they are allowed.
+
+The four `/api/auth` endpoints are the **only** ones that refuse a caller. Being
+wrong about a one-time code is not the same as asking for a service, so those
+return 400/401/429 while everything else answers 200 and explains itself in the
+body — a rule worth keeping, because the moment a second endpoint 401s the client
+needs a global error path and the anonymous-first promise starts leaking.
 
 Gone from v1, deliberately: `/rtc/webrtc/offer` (FastRTC), `/gradio` (a second
 Stream with its own divergent VAD tuning), and `/ws/cards` with its process-wide
@@ -26,6 +36,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from loguru import logger
 from pydantic import BaseModel
 
@@ -36,9 +47,13 @@ from pipecat.transports.smallwebrtc.request_handler import (
     SmallWebRTCRequestHandler,
 )
 
-from auth.identity import current_user
+from auth import anon, tokens
+from auth import routes as auth_routes
+from auth.identity import current_user, token_verified
+from auth.phone import mask
 from config import settings
 from models.identity import User
+from services import auth as auth_service
 from services import quota
 from services import resources as resource_factory
 from services import schemes as scheme_service
@@ -94,6 +109,29 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_routes.router)
+
+
+@app.exception_handler(auth_service.AuthError)
+async def auth_error_handler(_request: Request, exc: auth_service.AuthError):
+    """Turn a login failure into its HTTP form, in one place.
+
+    A handler rather than a `try` in each of the four endpoints: the mapping from
+    "what went wrong" to "which status" belongs to the error, and repeating it per
+    endpoint is how one of them ends up returning 500 for a wrong code.
+
+    `Retry-After` is a real header and clients and proxies honour it, so a rate
+    limit that carries one is a rate limit a well-behaved client will respect
+    without the app having to implement a timer.
+    """
+    headers = ({"Retry-After": str(exc.retry_after)}
+               if exc.retry_after is not None else None)
+    return JSONResponse(
+        status_code=exc.status,
+        content={"error": exc.code, "detail": exc.detail},
+        headers=headers,
+    )
 
 
 # ── Health ──────────────────────────────────────────────
@@ -185,6 +223,62 @@ async def quota_status(user: User = Depends(current_user)):
     caller says anything.
     """
     return _quota_payload(await quota.peek(app.state.resources, user))
+
+
+# ── The caller ──────────────────────────────────────────
+@app.get("/api/me")
+async def me(user: User = Depends(current_user),
+             verified: bool = Depends(token_verified)):
+    """Who the caller is, as far as they are allowed to be told.
+
+    `authenticated` reports whether this *request* proved it holds an access
+    token, not whether the identity happens to have a phone number on it. Those
+    differ for exactly one caller: someone who logged in on this device and is now
+    sending only the anonymous cookie. They get the larger allowance either way
+    (see `auth/identity.py`), but the phone number is personal data and the cookie
+    is not proof of anything about a person.
+
+    Slice 3 adds the profile here, which is why that distinction is worth having
+    before there is anything sensitive behind it.
+    """
+    allowance = await quota.peek(app.state.resources, user)
+    return {
+        "authenticated": verified,
+        "phone": mask(user.phone_e164) if verified else None,
+        "consent": {"version": user.consent_version,
+                    "at": user.consent_at.isoformat() if user.consent_at else None},
+        "quota": _quota_payload(allowance),
+    }
+
+
+@app.delete("/api/me")
+async def delete_me(response: Response, user: User = Depends(current_user),
+                    verified: bool = Depends(token_verified)):
+    """Erase the caller's account and everything referencing it (DPDP Act 2023).
+
+    Requires a verified access token, and this is the one place where refusing an
+    anonymous caller is right rather than a regression: an anonymous identity has
+    nothing to erase — no phone number, no profile, no consent record — and
+    honouring the request would delete a quota bucket, which is a way to reset an
+    allowance rather than a way to exercise a data right.
+
+    Both cookies are cleared, because leaving the anonymous one behind would leave
+    the caller carrying an id whose row no longer exists.
+    """
+    if not verified:
+        raise auth_service.AuthError(
+            401, "not_authenticated",
+            "Sign in first — there is no account to delete.")
+
+    await auth_service.delete_account(app.state.resources, user)
+
+    refresh = tokens.refresh_cookie_kwargs()
+    response.delete_cookie(key=refresh["key"], path=refresh["path"],
+                           httponly=True, samesite=refresh["samesite"])
+    anon_cookie = anon.cookie_kwargs()
+    response.delete_cookie(key=anon_cookie["key"], path=anon_cookie["path"],
+                           httponly=True, samesite=anon_cookie["samesite"])
+    return {"deleted": True}
 
 
 def _quota_payload(verdict: quota.Verdict) -> dict:

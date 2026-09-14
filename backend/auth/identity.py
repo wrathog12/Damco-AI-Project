@@ -24,10 +24,17 @@ correct answer.
 """
 from fastapi import Request, Response
 
-from auth import anon
+from auth import anon, tokens
 from config import settings
 from models.identity import User
+from services import auth as auth_service
 from services import quota
+
+
+def _access_user_id(request: Request) -> int | None:
+    """The user id in this request's `Authorization` header, if it verifies."""
+    return tokens.read_access(
+        tokens.bearer_token(request.headers.get("authorization")))
 
 
 async def current_user(request: Request, response: Response) -> User:
@@ -38,13 +45,28 @@ async def current_user(request: Request, response: Response) -> User:
     """
     resources = request.app.state.resources
 
-    # ── 1. authenticated? (slice 2 fills this in) ───────────────────────
-    # Deliberately left as an explicit no-op rather than omitted: the ordering is
-    # the security-relevant part, and a reader needs to see that a bearer token is
-    # checked *before* the cookie so a logged-in caller on a device that still has
-    # an anonymous cookie gets their real allowance.
+    # ── 1. authenticated? ───────────────────────────────────────────────
+    # Checked *before* the cookie, which is the security-relevant part: a caller
+    # who has logged in still has their old `bh_anon` cookie sitting in the
+    # browser, and preferring it would quietly serve them the ten-turn anonymous
+    # allowance they just signed in to escape.
+    #
+    # A token that verifies but names a row that no longer exists falls through to
+    # anonymous rather than 401ing. That happens for up to
+    # `access_token_ttl_minutes` after `DELETE /api/me`, and someone who has just
+    # erased their account should get a working app, not an error.
+    user_id = _access_user_id(request)
+    if user_id is not None:
+        user = await auth_service.user_by_id(resources, user_id)
+        if user is not None:
+            return user
 
     # ── 2. an anonymous identity we previously issued ───────────────────
+    # Note that after a first login this cookie resolves to the *promoted* row —
+    # the same row, now carrying a phone number — so the larger allowance applies
+    # even on a request that forgot the bearer token. That is deliberate for the
+    # quota, and it is why anything personal must check `token_verified` instead of
+    # inferring authorisation from `user.phone_e164`.
     anon_id = anon.verify(request.cookies.get(settings.anon_cookie_name))
 
     # ── 3. first contact ────────────────────────────────────────────────
@@ -53,3 +75,21 @@ async def current_user(request: Request, response: Response) -> User:
         response.set_cookie(value=cookie_value, **anon.cookie_kwargs())
 
     return await quota.get_or_create_anon(resources, anon_id)
+
+
+def token_verified(request: Request) -> bool:
+    """Did this request actually present a valid access token?
+
+    `user.phone_e164` answers "does this identity have an account", which is the
+    right question for the *quota* and the wrong one for authorisation. The
+    anonymous cookie of a promoted row still resolves to a row with a phone number
+    on it, so anything that returns personal data — the masked number today,
+    profiles and conversation history in slice 3 — must gate on this instead.
+
+    It re-verifies the header rather than reading a flag `current_user` left
+    behind. That is one extra signature check on the handful of endpoints that ask,
+    and it buys independence from FastAPI's dependency resolution order — a
+    security answer that is only correct when two dependencies happen to run in the
+    right sequence is one refactor away from being wrong.
+    """
+    return _access_user_id(request) is not None
