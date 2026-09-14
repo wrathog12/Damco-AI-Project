@@ -431,6 +431,14 @@ async def run_session(
         idle_timeout_secs=cfg.idle_timeout_secs,
         # We hang up ourselves so the client is told why first.
         cancel_on_idle_timeout=False,
+        # Pipecat's default is 20s, and one cold session here spends ~13s of it
+        # connecting Deepgram and Cartesia and warming the lazy imports. Two
+        # callers connecting at the same moment therefore blew the budget and both
+        # pipelines were torn down before the greeting — the caller hears *nothing*
+        # and the only clue is a dangling `greeting` task. This is a ceiling, not a
+        # delay: a session that sets up quickly is unaffected. The ~13s itself is a
+        # P5 problem.
+        setup_timeout_secs=45.0,
         params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
     )
 
