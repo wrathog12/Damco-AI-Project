@@ -17,7 +17,7 @@
 
 ## 📖 Overview
 
-**Bhasha-Agent** is a real-time, multilingual voice AI assistant that helps Indian citizens discover and understand government welfare schemes they are eligible for. Users simply **speak** in their preferred language (Hindi, English, or regional languages), and the agent responds conversationally — searching a curated knowledge base of **170+ schemes** across **6 states** and **Central Government** programs.
+**Bhasha-Agent** is a real-time, multilingual voice AI assistant that helps Indian citizens discover and understand government welfare schemes they are eligible for. Users simply **speak** in their preferred language (Hindi, English, or regional languages), and the agent responds conversationally — searching a curated knowledge base of **1430+ schemes** across **6 states** and **Central Government** programs.
 
 ### ✨ Key Highlights
 
