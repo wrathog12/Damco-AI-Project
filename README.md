@@ -261,7 +261,7 @@ bhasha-agent/
 | **Deepgram** | Speech-to-Text | [console.deepgram.com](https://console.deepgram.com) |
 | **Cartesia** | Text-to-Speech | [play.cartesia.ai](https://play.cartesia.ai/keys) |
 
-### 1. Clone & Configure
+### 1. Clone & Configure and startup 
 
 ```bash
 git clone https://github.com/wrathog12/Damco-AI-Project.git
