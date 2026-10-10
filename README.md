@@ -23,7 +23,7 @@
 
 **Bhasha-Agent** is a production-grade, real-time voice assistant that helps Indian citizens discover government welfare schemes they are eligible for. Users simply **speak** — in Hindi, English, Hinglish, Bengali, Marathi, or other regional languages — and the agent responds conversationally, searching a curated corpus of **1,786 schemes** across **all Indian states** and Central Government programs.
 
-The system is **anonymous-first**: no login wall, no OTP screen before value is delivered. A first-time caller talks to the agent immediately. Login is what you do when you want *more* — saved profile, conversation memory, and a larger turn allowance.
+The system is **anonymous-first**: no login wall, no OTP screen before value is delivered. A first-time caller talks to the agent immediately. Login is what you do when you want *more* — saved profile, conversation memory, and a larger turn allowance. Newly Integrated Pipecat3.0
 
 ---
 
